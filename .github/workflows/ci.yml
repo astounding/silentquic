@@ -1,0 +1,35 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - run: cargo test --all
+      - run: cargo clippy --all --all-targets -- -D warnings
+      # The sans-IO core must stay drivable from a hand-rolled event loop, and
+      # the reference loop is documentation people copy — so it is compiled and
+      # RUN here, not merely built.
+      - run: cargo run -p silentquic-proto --example poll_loop
+      # The core must never grow a runtime dependency; that is the whole point
+      # of the crate split.
+      - name: silentquic-proto has no tokio
+        run: "! cargo tree -p silentquic-proto | grep -qi tokio"
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          # cmake is required: aws-lc-rs compiles native code via cmake, and the
+          # build fails with an unobvious error without it.
+          prepare: pkg install -y rust cmake
+          run: |
+            cargo test --all
+            cargo run -p silentquic-proto --example poll_loop

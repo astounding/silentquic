@@ -1,0 +1,273 @@
+# silentquic
+
+> **Repository status & roadmap:** see [STATUS.md](STATUS.md). Historical
+> decisions and corrections are summarized in [HISTORY.md](HISTORY.md).
+
+A cloaked QUIC transport library, in Rust: a server built on `silentquic` is
+**invisible to network scanners** — it emits zero bytes in response to any
+packet that doesn't prove possession of a valid pre-shared key (PSK) — and its
+traffic **camouflages as ordinary QUIC v1/HTTP3**, blending into the large
+volume of legitimate internet QUIC. Authentication and per-client key
+*selection* are folded into the QUIC `Initial` packet itself, so unauthorized
+traffic is rejected before any connection state is allocated and before any
+byte is sent back.
+
+`silentquic` is a standalone transport library. It contains no application
+logic; it exposes raw authenticated bidirectional byte streams for a caller
+(e.g. a backup tool, a config-push agent, anything that wants a QUIC pipe that
+doesn't advertise itself to the internet) to frame however it likes.
+
+## Architecture: two crates, pick your I/O model
+
+| Crate | What it is | Use it when |
+|---|---|---|
+| **`silentquic-proto`** (`proto/`) | The **sans-IO core**. No I/O, no async runtime, no threads, and it never blocks or reads the clock — you own the socket and pass `now` in. | You have your own event loop, or you're embedding via FFI |
+| **`silentquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `async` `Server`/`Client`/`Connection`/`Stream`. | Your application is already `async`/`.await` |
+
+This mirrors `quinn-proto`/`quinn`, and it exists because the two I/O models are
+mutually exclusive: tokio owns the thread and parks in `epoll`/`kqueue` when
+idle, so it cannot be embedded in a hand-rolled loop that polls with a zero
+timeout and has other work to do between passes. Layering serves both instead of
+compromising either.
+
+`proto/examples/poll_loop.rs` is the reference for the sans-IO path — a single
+thread, non-blocking sockets, nothing that parks — and it is run in CI so it
+cannot rot.
+
+**The silence invariant is stronger in the core.** *A datagram that fails the
+cloaking pre-filter queues nothing to send.* `handle_datagram` returns before
+such a packet ever reaches quinn-proto, so there is nothing for `poll_transmit`
+to hand back: an embedder driving the state machine by hand **cannot** reply to
+an unauthorized peer, even by mistake. Invisibility is a property of the API
+rather than of the caller's control flow.
+
+Full design rationale lives in
+[`docs/specs/2026-07-03-silentquic-design.md`](docs/specs/2026-07-03-silentquic-design.md).
+This README's Threat Model section below reproduces the spec's threat model
+verbatim in substance — read it before deploying.
+
+---
+
+## Quickstart
+
+### 1. Generate a PSK
+
+The PSK is 32 random bytes, hex-encoded (64 hex characters), shared out of
+band between server and client — the same trust model as an SSH
+`authorized_keys` entry or a WireGuard PSK.
+
+```sh
+openssl rand -hex 32
+```
+
+### 2. Server config (`server.toml`)
+
+The server holds the listen address and the full set of authorized clients
+(`client_id -> psk`). `chmod 600` it — it's cleartext secret material on disk.
+
+```toml
+listen = "0.0.0.0:443"
+
+[[clients]]
+client_id = "backup-host-1"
+psk = "3f9a1c...<64 hex chars>...b2"
+
+[[clients]]
+client_id = "backup-host-2"
+psk = "7e02dd...<64 hex chars>...11"
+```
+
+### 3. Client config (`client.toml`)
+
+Each client holds its own identity, its PSK, and the server it dials.
+
+```toml
+client_id = "backup-host-1"
+psk = "3f9a1c...<64 hex chars>...b2"
+server = "203.0.113.7:443"
+```
+
+### 4. Server: bind and accept connections
+
+```rust
+use silentquic::config::{FileSource, SecretSource};
+use silentquic::server::Server;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let secrets = FileSource::new("server.toml").load()?;
+    let mut server = Server::bind(secrets).await?;
+    println!("listening on {}", server.local_addr());
+
+    while let Some(conn) = server.accept().await {
+        tokio::spawn(async move {
+            // Only ever fires for a peer that proved PSK possession and
+            // completed the QUIC handshake — unauthorized peers never reach
+            // this point at all.
+            let mut stream = conn.accept_stream().await.expect("accept stream");
+            let msg = stream.read_to_end().await.expect("read");
+            println!("got {} bytes from {}", msg.len(), conn.remote_address());
+        });
+    }
+    Ok(())
+}
+```
+
+### 5. Client: connect and open a stream
+
+```rust
+use silentquic::client::Client;
+use silentquic::config::ClientConfigFile;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string("client.toml")?;
+    let cfg: ClientConfigFile = toml::from_str(&text)?;
+
+    let conn = Client::connect(cfg).await?;
+    let mut stream = conn.open_stream().await?;
+    stream.write_all(b"hello over a cloaked pipe").await?;
+    stream.finish().await?;
+    Ok(())
+}
+```
+
+That's the whole surface for v1: `Server::bind` / `Server::accept`,
+`Client::connect`, and `Connection::open_stream` / `accept_stream` /
+`Stream::write_all` / `finish` / `read_to_end`. Framing on top of these raw
+byte streams is left to the caller.
+
+The underlying `quinn_proto::Connection` is reachable via
+`Connection::quinn_connection()`, which returns a `QuinnHandle` exposing
+bidirectional-stream commands (`open_bi` / `accept_bi`) routed through the same
+driver channel the cloaking layer uses — so the cloaking/routing code does not
+have to change to layer a higher-level protocol on top. Note that this is a
+seam for a FUTURE direction, not a drop-in today: HTTP/3, for example, also
+needs unidirectional streams (h3 uses uni streams for its control stream and
+QPACK encoder/decoder), and the handle does not yet expose uni-stream commands.
+See [Limitations](#limitations--not-yet-production-hardened) below.
+
+---
+
+## Threat Model
+
+Stated plainly here so no operator over-trusts this library. (Reproduced from
+the design spec, §3.)
+
+### What silentquic defeats
+
+- **Internet-wide active scanning** (nmap, zmap, masscan) and search engines
+  (Shodan, Censys): the server never responds to an unauthorized probe, so it
+  appears as a closed/filtered UDP port. UDP has no kernel-level handshake to
+  refuse, so the silence is complete — no RST, no distinguishable timeout, no
+  TLS alert.
+- **Netflow / flow-log classification** and **casual DPI**: traffic looks like
+  a normal QUIC connection to some IP on UDP/443.
+
+### What silentquic does NOT defeat
+
+- **Global passive traffic analysis.** Backups (or any bulk transfer) are
+  large and periodic; the *volume and timing pattern* of traffic to a fixed
+  endpoint leaks even when service identity and content do not. No
+  packet-level trick hides this.
+- **Sophisticated DPI that actively attempts `Initial` decryption on every
+  flow.** In stock QUIC, the `Initial` packet is protected with keys derived
+  from a *published* version salt plus the on-wire Destination Connection ID
+  (DCID), so any observer can unseal it and read the TLS ClientHello. Because
+  silentquic **re-keys the `Initial` with the PSK**, such an observer's unseal
+  attempt produces garbage — revealing "QUIC whose Initial won't decrypt," an
+  anomaly resembling an unknown/broken QUIC variant. This is the irreducible
+  cost of folding authentication into the `Initial`; it cannot be avoided
+  without surrendering auth secrecy. It is a non-issue against scanning and
+  casual detection, and no packet-level design defeats an adversary already
+  decrypting every QUIC `Initial` on the link.
+- **Resource side-channel via a co-located service.** Even a silent server
+  consumes CPU/memory to process-then-drop junk packets. An attacker flooding
+  the host and watching an *unrelated* co-located service's latency can infer
+  that something is doing per-packet crypto work. Mitigations (bounded,
+  allocation-free reject path; cheap MAC compares before any expensive AEAD
+  unseal; per-source and global rate limits) bound and flatten this channel
+  but cannot close it.
+
+  **Recommended deployment: run silentquic as the only service on its host.**
+
+---
+
+## Limitations / Not Yet Production-Hardened
+
+These are known, deliberate boundaries of the current implementation —
+surfaced here so users know exactly where the edges are, rather than
+discovering them under load.
+
+1. **Single-threaded driver.** Both the server and client each run a single
+   sans-IO driver task that awaits `socket.send_to()` inline while pumping
+   connections. This is a single-threaded throughput chokepoint: fine for a
+   handful of concurrent clients (the expected backup-transport use case), but
+   not tuned for high fan-out (hundreds+ of simultaneous connections on one
+   server).
+2. **`Stream::read_to_end` buffers the entire stream in memory, unbounded.**
+   A post-authentication peer that opens a stream and sends an unbounded
+   amount of data can exhaust server memory. There is no bounded/chunked read
+   API yet — that's future work. This is fine for today's intended use
+   (control messages and bounded-size payloads) but callers moving large,
+   attacker-influenced payloads over `silentquic` should not rely on
+   `read_to_end` as-is.
+3. **Rate-limit parameters are compile-time constants**, not yet configurable
+   via TOML. The per-source and global buckets that bound the unauthenticated
+   pre-filter's CPU cost (see Threat Model, resource side-channel) cannot
+   currently be tuned per deployment without a code change.
+4. **Mid-connection retired connection IDs are pruned only when the
+   connection closes.** quinn-proto 0.11 exposes no hook for observing
+   per-CID retirement mid-connection (only whole-connection loss), so the
+   server's CID→connection routing set grows with every CID a live connection
+   is issued and only shrinks when that connection ends. Memory use is
+   bounded by `live connections × CIDs issued per connection`, which is small
+   in practice, but it is not the tightest possible bound.
+
+   There is also a byte-emission (not just memory) facet: because a
+   retired-but-not-yet-pruned CID stays in the active routing set until the
+   connection closes, an **on-path** adversary who has already captured a live
+   connection's CIDs could send a packet to a retired CID and elicit a
+   stateless reset from the server. This is strictly within the documented
+   on-path threat boundary — it requires having observed the connection's live
+   CIDs in the first place, so it is out of scope for the scanner / off-path
+   model this library defends against — but it is worth calling out explicitly
+   because it is a case where the server *does* emit bytes.
+
+5. **Handshake loss-recovery leans on the server's PTO, not the client's
+   Initial retransmits.** For a given connection attempt the client fixes its
+   selector DCID (and therefore the nonce/freshness embedded in it), so every
+   Initial the client sends during that attempt carries the *same* (nonce,
+   freshness) pair. The server's replay guard records that pair on first sight
+   and drops every subsequent datagram carrying it — which includes the
+   client's own Initial *retransmits*. Handshakes still converge (they rely on
+   the server's PTO-driven retransmissions of its own handshake flight rather
+   than on the client re-driving its Initial), but robustness under heavy
+   early-flight packet loss is reduced relative to stock QUIC.
+
+   The naive "fix" — making the selector DCID an *active* routing target after
+   admission so same-flight retransmits pass through — is **unsafe** and is
+   deliberately not implemented: it would let a captured Initial be replayed to
+   elicit a response, breaking the silence contract. A future refinement could
+   allow same-source in-progress retransmits without weakening replay
+   protection, but that requires careful design and is out of scope for v1.
+
+## Non-goals (v1)
+
+- **No HTTP/3.** Standard QUIC stays on the wire specifically so an
+  off-the-shelf HTTP/3 stack can be layered on top later via
+  `Connection::quinn_connection()` without touching the cloaking layer. This is
+  a supported *future direction*, not a drop-in today: the `QuinnHandle`
+  currently exposes only bidirectional-stream commands, whereas h3 additionally
+  requires unidirectional streams (for its control stream and QPACK
+  encoder/decoder). Adding those uni-stream commands to the handle is the
+  remaining work; it stays confined to the handle and does not disturb the
+  silence-critical routing.
+- **No certificate-based authentication.** PSK only; the TLS certificate is a
+  throwaway self-signed identity and is not part of the trust model.
+
+---
+
+## License
+
+0BSD (BSD Zero Clause). See [`LICENSE`](LICENSE).

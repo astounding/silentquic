@@ -1,0 +1,7 @@
+/target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/claude_test_ed25519
+/claude_test_ed25519.pub
+/.superpowers/

@@ -1,0 +1,1150 @@
+// SPDX-License-Identifier: 0BSD
+//! The sans-IO endpoint: a cloaked QUIC state machine the caller drives.
+//!
+//! Nothing here performs I/O, spawns, blocks, or reads the monotonic clock. The
+//! caller owns the socket and passes `now` explicitly, which is what makes
+//! silentquic embeddable in a hand-rolled event loop (see
+//! `examples/poll_loop.rs`).
+//!
+//! # The silence invariant
+//!
+//! **A datagram that fails the cloaking pre-filter queues nothing to send.**
+//!
+//! [`Endpoint::handle_datagram`] runs the full pre-filter — rate limiter,
+//! long-header parse, exact selector length, PSK selector match, freshness,
+//! anti-replay — *before* the datagram is allowed anywhere near quinn-proto. A
+//! packet that fails any of those gates returns from `handle_datagram` without
+//! ever reaching quinn-proto, so nothing can have been queued: a caller
+//! who faithfully drains [`Endpoint::poll_transmit`] still emits zero bytes to
+//! an unauthorized peer. Invisibility is therefore a property of this API, not
+//! of the caller's control flow — a C-style embedder cannot reply by mistake.
+//!
+//! The invariant is about pre-filter *rejection*, not about the
+//! [`DatagramOutcome::Dropped`] return value. `Dropped` is the wider category
+//! "this datagram produced no connection handle for you", and a datagram that
+//! *passed* the pre-filter can legitimately be `Dropped` while still queuing an
+//! endpoint-level response — the reachable case is a peer that proved PSK
+//! possession but asked for a QUIC version we do not speak, which earns a
+//! Version Negotiation packet. That peer is authorized, so answering it does not
+//! break silence. See [`DatagramOutcome::Dropped`].
+//!
+//! # The driving contract
+//!
+//! One pass of a caller's loop looks like this, and **the order matters**:
+//!
+//! ```text
+//! // 1. feed every inbound datagram
+//! ep.handle_datagram(now, from, &pkt);
+//! // 2. service the timer deadline, if it is due
+//! if ep.next_timeout().is_some_and(|t| t <= now) { ep.handle_timeout(now) }
+//! // 3. drain ALL events, doing the caller's stream work as they arrive
+//! while let Some(e) = ep.poll_event() { react(e) /* stream_read / stream_write / ... */ }
+//! // 4. drain ALL transmits — LAST, after every stream operation of this pass
+//! while let Some(t) = ep.poll_transmit(now) { send_to(&t.contents, t.destination) }
+//! // 5. only now is the deadline meaningful
+//! sleep_until(ep.next_timeout());
+//! ```
+//!
+//! Two obligations, both load-bearing:
+//!
+//! * **[`Endpoint::poll_transmit`] must be drained to `None`, and it must come
+//!   after the caller's stream work.** It is the only method that services
+//!   connections lazily, so a caller who stops early — or who drains transmits
+//!   *before* calling `stream_read`/`stream_write` — leaves stream bytes and
+//!   flow-control credit unsent. Draining first is the classic sans-IO stall:
+//!   the credit a `stream_read` released never reaches the peer, the peer stays
+//!   blocked, nothing arrives to wake the loop, and the connection hangs until
+//!   the idle timeout.
+//! * **[`Endpoint::next_timeout`] is read last.** It is refreshed by every
+//!   servicing pass, so it only reflects the current pass once `poll_transmit`
+//!   has returned `None`.
+//!
+//! The first obligation is also enforced rather than merely documented: any
+//! caller-side stream operation that can produce something to send marks its
+//! connection *dirty*, and while any connection is dirty `next_timeout()`
+//! returns an already-elapsed deadline. A caller that gets the order wrong and
+//! sleeps on that value wakes immediately instead of sleeping through the stall.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use bytes::BytesMut;
+use quinn_proto::{
+    ClientConfig as TransportClientConfig, ConnectionHandle, ConnectionId, DatagramEvent,
+    EndpointConfig, ServerConfig as TransportServerConfig,
+};
+
+use crate::config::{ClientConfigFile, ConfigError, Psk, ServerSecrets};
+use crate::conn::ConnState;
+use crate::crypto::{
+    quic_client_config, random_bytes, reset_key, token_key, RecordingCidGenerator, SelfSigned,
+};
+use crate::freshness::{is_fresh, now_minutes, WINDOW_MINUTES};
+use crate::initial_keys::{PskClientConfig, PskServerConfig};
+use crate::outcome::{DatagramOutcome, Event, Transmit};
+use crate::ratelimit::RateLimiter;
+use crate::replay::ReplayGuard;
+use crate::selector::{build_dcid, parse_dcid, selector_matches, DcidParts, DCID_LEN};
+use crate::transport::peek_dcid;
+
+/// Length of the connection IDs this endpoint issues for its own connections.
+pub const LOCAL_CID_LEN: usize = 8;
+
+/// The TLS server name a client presents in its ClientHello. It authenticates
+/// nothing (the PSK does, and certificate verification is skipped), so any
+/// stable name works; `localhost` matches the server's self-signed identity.
+const SERVER_NAME: &str = "localhost";
+
+/// Which side of the protocol an [`Endpoint`] plays.
+///
+/// The distinction is load-bearing in exactly two places, both in
+/// [`Endpoint::handle_datagram`]/[`Endpoint::feed`]: only a server runs the
+/// cloaking pre-filter (a client has no PSK *set* to select from — it dials one
+/// known server), and only a server may emit an endpoint-level response.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    Server,
+    Client,
+}
+
+/// One authorized client's PSK and its PSK-rekeyed transport config.
+struct ClientCrypto {
+    psk: Psk,
+    server_config: Arc<TransportServerConfig>,
+}
+
+/// Build one PSK-rekeyed transport `ServerConfig` per authorized client.
+fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigError> {
+    // A single self-signed identity is fine: the PSK — not the TLS certificate —
+    // authenticates the peer (the client skips cert verification). One identity
+    // shared across PSKs keeps setup trivial.
+    let identity = SelfSigned::generate()
+        .map_err(|e| ConfigError::Io(std::io::Error::other(format!("tls identity: {e}"))))?;
+    let quic_server = identity.quic_server_config().map_err(|e| {
+        ConfigError::Io(std::io::Error::other(format!("quic server config: {e}")))
+    })?;
+
+    let token_key = token_key();
+
+    let mut clients = Vec::with_capacity(secrets.clients.len());
+    for entry in &secrets.clients {
+        let psk = *entry.psk.as_bytes();
+        let crypto = Arc::new(PskServerConfig::new(quic_server.clone(), psk));
+        let server_config = Arc::new(TransportServerConfig::new(crypto, token_key.clone()));
+        clients.push(ClientCrypto {
+            psk: entry.psk.clone(),
+            server_config,
+        });
+    }
+    Ok(clients)
+}
+
+/// An `EndpointConfig` whose CID generator records every CID it mints.
+///
+/// Two consumers, one generator: `issued` is THE routing table that lets
+/// post-handshake packets bypass the pre-filter, and `pending` preserves mint
+/// order so a freshly minted CID can be attributed to the connection being
+/// serviced (see [`Endpoint::drain_pending_cids`]). quinn-proto builds one
+/// shared generator per endpoint and exposes no CID→connection accessor, so
+/// this is the only way to know who owns a CID.
+fn recording_endpoint_config(
+    issued: &Arc<Mutex<HashSet<ConnectionId>>>,
+    pending: &Arc<Mutex<Vec<ConnectionId>>>,
+) -> EndpointConfig {
+    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key()));
+    let recorder = issued.clone();
+    let pending = pending.clone();
+    endpoint_config.cid_generator(move || {
+        Box::new(RecordingCidGenerator::new(
+            LOCAL_CID_LEN,
+            recorder.clone(),
+            pending.clone(),
+        ))
+    });
+    endpoint_config
+}
+
+/// A cloaked QUIC endpoint, driven entirely by the caller.
+pub struct Endpoint {
+    inner: quinn_proto::Endpoint,
+    role: Role,
+    /// Authorized clients. Empty for [`Role::Client`].
+    clients: Vec<ClientCrypto>,
+    /// Per-client anti-replay guards (index-aligned with `clients`).
+    replay: Vec<ReplayGuard>,
+    /// Bounds the CPU cost of the unauthenticated pre-filter path: consulted
+    /// BEFORE any selector/MAC work, so a flood is dropped at near-zero cost.
+    rate_limiter: RateLimiter,
+    /// Every CID this endpoint has issued, for routing post-handshake packets
+    /// without re-running the pre-filter. A CID leaves this set in exactly one
+    /// place — [`Endpoint::prune_connection_cids`], strictly after its owning
+    /// connection has been reaped — so a live CID can never stop routing.
+    issued_cids: Arc<Mutex<HashSet<ConnectionId>>>,
+    /// Mint order, so a freshly issued CID can be attributed to the connection
+    /// being serviced. Drained immediately after every endpoint call that can
+    /// mint (`connect`, `accept`, per-handle `handle_event`).
+    pending_cids: Arc<Mutex<Vec<ConnectionId>>>,
+    /// CIDs in `issued_cids` grouped by owner, so a lost connection's — and only
+    /// a lost connection's — CIDs can be pruned. Never touched for a live one.
+    cids_by_conn: HashMap<ConnectionHandle, Vec<ConnectionId>>,
+    /// Live connections, each wrapped in the [`ConnState`] that owns its
+    /// per-stream bookkeeping.
+    connections: HashMap<ConnectionHandle, ConnState>,
+    /// Datagrams the caller should send, drained by [`Endpoint::poll_transmit`].
+    outbound: VecDeque<Transmit>,
+    /// Things the caller should react to, drained by [`Endpoint::poll_event`].
+    events: VecDeque<Event>,
+    /// Earliest connection deadline, recomputed by every servicing pass. Cached
+    /// because quinn-proto's `Connection::poll_timeout` takes `&mut self` even
+    /// though it only reads `timers.next_timeout()`, and [`Endpoint::next_timeout`]
+    /// is a `&self` query.
+    next_timeout: Option<Instant>,
+    /// The `now` of the most recent servicing pass (or of the dial, for a
+    /// client). Used as the "already elapsed" deadline [`Endpoint::next_timeout`]
+    /// reports while a connection is dirty: the caller's clock is monotonic and
+    /// non-decreasing, so an instant it already handed us can never be in the
+    /// future.
+    last_service: Option<Instant>,
+}
+
+impl Endpoint {
+    /// Build a server endpoint from parsed secrets.
+    pub fn new_server(secrets: ServerSecrets) -> Result<Self, ConfigError> {
+        let clients = build_clients(&secrets)?;
+
+        let issued_cids: Arc<Mutex<HashSet<ConnectionId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let pending_cids: Arc<Mutex<Vec<ConnectionId>>> = Arc::new(Mutex::new(Vec::new()));
+        let endpoint_config = recording_endpoint_config(&issued_cids, &pending_cids);
+
+        // Starts with no server config; the correct per-PSK `ServerConfig` is
+        // installed by the pre-filter right before an admitted Initial reaches
+        // `handle`.
+        let inner = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, true, None);
+
+        let replay = clients
+            .iter()
+            .map(|_| ReplayGuard::new(WINDOW_MINUTES))
+            .collect();
+
+        Ok(Self {
+            inner,
+            role: Role::Server,
+            clients,
+            replay,
+            rate_limiter: RateLimiter::new(),
+            issued_cids,
+            pending_cids,
+            cids_by_conn: HashMap::new(),
+            connections: HashMap::new(),
+            outbound: VecDeque::new(),
+            events: VecDeque::new(),
+            next_timeout: None,
+            last_service: None,
+        })
+    }
+
+    /// Build a client endpoint and start dialing the server named in `cfg`.
+    ///
+    /// Returns the endpoint plus the handle of the one connection it owns. The
+    /// handshake has NOT completed yet: the caller drives it by pumping
+    /// [`Endpoint::poll_transmit`] / [`Endpoint::handle_datagram`] until
+    /// [`Event::Connected`] arrives.
+    ///
+    /// Two seams make the dial *cloaked* rather than stock QUIC, and both are
+    /// installed here:
+    ///
+    /// * **Initial DCID** — instead of a random first-flight DCID, it is
+    ///   `build_dcid(psk, nonce, freshness)`, installed via
+    ///   [`quinn_proto::ClientConfig::initial_dst_cid_provider`]. The server's
+    ///   pre-filter recomputes that selector from its own PSK and admits only a
+    ///   match; everything else is dropped in silence.
+    /// * **Initial packet keys** — [`PskClientConfig`] overrides *only*
+    ///   `initial_keys`, deriving them from the PSK instead of the published
+    ///   version salt, so an observer cannot unseal the ClientHello.
+    ///
+    /// Everything after the Initial is ordinary QUIC v1.
+    ///
+    /// # `now` and `freshness_minute`
+    ///
+    /// **The core never reads a clock — neither of them.** Both of the clocks a
+    /// cloaked dial needs are supplied by the caller:
+    ///
+    /// * `now` is the current *monotonic* instant, because
+    ///   `quinn_proto::Endpoint::connect` seeds the connection's timers from it,
+    ///   exactly as for [`Endpoint::handle_datagram`].
+    /// * `freshness_minute` is the current *wall-clock* minute — Unix seconds
+    ///   divided by 60 — which goes into the selector DCID and which the
+    ///   server's pre-filter re-derives and checks against its own clock (see
+    ///   [`crate::freshness`]). Production callers pass
+    ///   [`crate::freshness::now_minutes()`]; a test passes whatever it likes,
+    ///   which is what makes a stale-selector case reproducible rather than a
+    ///   race against the wall clock, and what lets a C embedder own both
+    ///   clocks.
+    pub fn new_client(
+        now: Instant,
+        freshness_minute: u32,
+        cfg: ClientConfigFile,
+    ) -> Result<(Self, ConnectionHandle), ConfigError> {
+        let psk = *cfg.psk.as_bytes();
+        let server_addr = cfg.server;
+
+        // 1. The blinded selector DCID: a random nonce + the caller-supplied
+        //    coarse minute, keyed by the PSK.
+        let nonce = random_bytes::<8>();
+        let dcid = build_dcid(&psk, nonce, freshness_minute);
+
+        // 2. Client crypto: stock TLS 1.3 (cert verification skipped — the PSK
+        //    authenticates), wrapped to re-key the Initial packet from the PSK.
+        let quic_client = quic_client_config()
+            .map_err(|e| ConfigError::Io(std::io::Error::other(format!("client crypto: {e}"))))?;
+        let psk_client = Arc::new(PskClientConfig::new(quic_client, psk));
+        let mut client_config = TransportClientConfig::new(psk_client);
+
+        // 3. Force the first-flight DCID to the selector.
+        client_config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&dcid)));
+
+        let issued_cids: Arc<Mutex<HashSet<ConnectionId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let pending_cids: Arc<Mutex<Vec<ConnectionId>>> = Arc::new(Mutex::new(Vec::new()));
+        let endpoint_config = recording_endpoint_config(&issued_cids, &pending_cids);
+
+        // A client endpoint has no server config: it never accepts.
+        let mut inner = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, true, None);
+        let (ch, conn) = inner
+            .connect(now, client_config, server_addr, SERVER_NAME)
+            .map_err(|e| ConfigError::Io(std::io::Error::other(format!("connect: {e}"))))?;
+
+        let mut endpoint = Self {
+            inner,
+            role: Role::Client,
+            clients: Vec::new(),
+            replay: Vec::new(),
+            rate_limiter: RateLimiter::new(),
+            issued_cids,
+            pending_cids,
+            cids_by_conn: HashMap::new(),
+            connections: HashMap::new(),
+            outbound: VecDeque::new(),
+            events: VecDeque::new(),
+            next_timeout: None,
+            // The dial instant doubles as the first "already elapsed" deadline,
+            // so `next_timeout()` has one to report if the caller does stream
+            // work before the first servicing pass.
+            last_service: Some(now),
+        };
+        // `connect` minted this connection's initial local CID via the recorder;
+        // attribute it to `ch` so it is pruned when the connection is lost.
+        endpoint.drain_pending_cids(ch);
+        endpoint.connections.insert(ch, ConnState::new(conn));
+        endpoint.refresh_next_timeout();
+        Ok((endpoint, ch))
+    }
+
+    /// Feed one inbound datagram.
+    ///
+    /// A packet that **fails the cloaking pre-filter** returns
+    /// [`DatagramOutcome::Dropped`] having queued nothing to send, and having
+    /// touched no connection state. That is the silence invariant, and it is why
+    /// every early return below happens before `feed`.
+    ///
+    /// A packet that *passes* the pre-filter may still be `Dropped` — see
+    /// [`DatagramOutcome::Dropped`] — and such a packet can queue an
+    /// endpoint-level response, because its sender has already proved PSK
+    /// possession.
+    pub fn handle_datagram(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        data: &[u8],
+    ) -> DatagramOutcome {
+        if self.role == Role::Server && !self.is_active_dcid(data) {
+            // NEW-CONNECTION ATTEMPT: run the silence pre-filter.
+            //
+            // The rate limiter is consulted BEFORE any selector/MAC work, so a
+            // flood of junk — from one source or sprayed across many spoofed
+            // sources — is dropped at near-zero cost. UDP source IPs are
+            // spoofable, so the GLOBAL bucket is the real backstop. Only
+            // would-be-new connections reach here; already-authenticated
+            // post-handshake traffic is never throttled.
+            if !self.rate_limiter.check(from.ip(), now) {
+                return DatagramOutcome::Dropped;
+            }
+            let Some(client_idx) = self.prefilter(data) else {
+                return DatagramOutcome::Dropped;
+            };
+            // Install the matching PSK's server config so `handle_first_packet`
+            // derives the correct PSK Initial keys.
+            self.inner
+                .set_server_config(Some(self.clients[client_idx].server_config.clone()));
+        }
+
+        let outcome = self.feed(now, from, data);
+        // The datagram was admitted, so whatever it unblocked — a handshake
+        // step, stream data, a lifecycle transition — is turned into queued
+        // transmits and events right here, before the caller polls either.
+        self.service_connections(now);
+        outcome
+    }
+
+    /// Take the next datagram the caller should send, if any.
+    ///
+    /// Services every live connection when the outbound queue runs dry, which is
+    /// what turns caller-side stream work (`conn_mut(ch).stream_write(..)`) into
+    /// bytes on the wire. A caller MUST loop this until it returns `None` each
+    /// pass; skipping it stalls connections silently.
+    pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
+        if let Some(t) = self.outbound.pop_front() {
+            return Some(t);
+        }
+        self.service_connections(now);
+        self.outbound.pop_front()
+    }
+
+    /// Take the next thing the caller should react to, if any.
+    ///
+    /// Events are produced by [`Endpoint::handle_datagram`],
+    /// [`Endpoint::handle_timeout`] and [`Endpoint::poll_transmit`] — this is a
+    /// pure drain, which is why it needs no `now`.
+    pub fn poll_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
+    /// The earliest instant at which [`Endpoint::handle_timeout`] must be called,
+    /// or `None` if no connection has a pending timer.
+    ///
+    /// Recomputed at the end of every servicing pass, so read it *after* draining
+    /// [`Endpoint::poll_transmit`] to `None` — that is the point at which every
+    /// connection's timers reflect all the work of the current pass.
+    ///
+    /// # The dirty guarantee
+    ///
+    /// If any caller-side stream operation that can produce something to send —
+    /// [`ConnState::stream_read`] (which releases flow-control credit),
+    /// [`ConnState::stream_write`], [`ConnState::stream_finish`],
+    /// [`ConnState::stream_reset`], [`ConnState::stream_stop`] — has run since
+    /// the last servicing pass, this returns a deadline that has **already
+    /// elapsed**. A caller that gets the loop order wrong and sleeps here is
+    /// therefore forced straight back around the loop instead of sleeping
+    /// through a stall: the credit or the bytes reach the peer on the next
+    /// `poll_transmit` drain rather than at the idle timeout.
+    ///
+    /// The flag is cleared by the servicing pass that flushes the work, so the
+    /// elapsed deadline is reported at most until the next
+    /// `poll_transmit`-to-`None`.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        if self.connections.values().any(ConnState::is_dirty) {
+            // `last_service` is an instant the caller itself handed us on an
+            // earlier pass, so on a monotonic clock it is necessarily <= "now".
+            // It is always `Some` whenever a connection exists (set by the dial
+            // and by every servicing pass); the `or` is belt and braces.
+            return self.last_service.or(self.next_timeout);
+        }
+        self.next_timeout
+    }
+
+    /// Advance every connection whose timer has expired, then service.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        for state in self.connections.values_mut() {
+            if state.conn_mut().poll_timeout().is_some_and(|t| t <= now) {
+                state.conn_mut().handle_timeout(now);
+            }
+        }
+        self.service_connections(now);
+    }
+
+    /// Borrow a live connection for stream work, or `None` if `ch` is not (or is
+    /// no longer) a connection of this endpoint.
+    ///
+    /// A `None` here after an [`Event::ConnectionLost`] is not an error: the
+    /// endpoint has reaped the connection and the handle is dead.
+    ///
+    /// # ⚠ A stale handle can return the WRONG connection
+    ///
+    /// `ConnectionHandle` is quinn-proto's slab index, and quinn-proto **reuses
+    /// a freed index for the next connection it accepts**. A handle is invalid
+    /// the moment [`Event::ConnectionLost`] is observed for it, and a `Some`
+    /// returned here for a handle that has since been lost may be a *different,
+    /// live* connection rather than `None` — silently, with no error.
+    ///
+    /// Callers that retain handles MUST therefore drain
+    /// [`Endpoint::poll_event`] and drop every handle named by an
+    /// [`Event::ConnectionLost`] **before** using any retained handle again.
+    /// `conn_mut` returning `Some` is not evidence that the handle you are
+    /// holding is still the connection you think it is.
+    ///
+    /// (The structural fix is a generation counter on the handle; it is a
+    /// deliberate follow-up, not implemented here.)
+    pub fn conn_mut(&mut self, ch: ConnectionHandle) -> Option<&mut ConnState> {
+        self.connections.get_mut(&ch)
+    }
+
+    /// How many connection IDs currently route to a live connection.
+    ///
+    /// Observability for the routing set: it must grow as connections are
+    /// admitted and shrink back when they are lost. A count that never returns
+    /// to its baseline across many connections is the CID leak this endpoint's
+    /// `cids_by_conn` bookkeeping exists to prevent.
+    pub fn issued_cid_count(&self) -> usize {
+        self.issued_cids.lock().expect("issued_cids poisoned").len()
+    }
+
+    // -- internals ---------------------------------------------------------
+
+    /// True iff `data`'s DCID belongs to a connection we created.
+    fn is_active_dcid(&self, data: &[u8]) -> bool {
+        let Some(dcid) = read_dcid_any(data) else {
+            return false;
+        };
+        let cid = ConnectionId::new(dcid);
+        self.issued_cids
+            .lock()
+            .expect("issued_cids poisoned")
+            .contains(&cid)
+    }
+
+    /// The full pre-filter. `Some(client_index)` admits; `None` drops silently.
+    ///
+    /// Order is load-bearing: freshness is checked BEFORE the replay guard so
+    /// future-dated nonces cannot accumulate in the replay set.
+    fn prefilter(&mut self, data: &[u8]) -> Option<usize> {
+        // 1. long-header parse
+        let dcid = peek_dcid(data)?;
+        // 2. exact selector length
+        if dcid.len() != DCID_LEN {
+            return None;
+        }
+        let parts = parse_dcid(dcid)?;
+        // 3. freshness (enforces BOTH bounds; before the replay guard)
+        let minute = now_minutes();
+        if !is_fresh(parts.freshness, minute, WINDOW_MINUTES) {
+            return None;
+        }
+        // 4. select PSK
+        let client_idx = self.select_psk(&parts)?;
+        // 5. anti-replay (lower-bound enforcement + dedupe)
+        if !self.replay[client_idx].check_and_record(parts.nonce, parts.freshness, minute) {
+            return None;
+        }
+        Some(client_idx)
+    }
+
+    /// Iterate the client set, returning the index of the PSK whose selector
+    /// matches. Each `selector_matches` compare is constant-time.
+    fn select_psk(&self, parts: &DcidParts) -> Option<usize> {
+        self.clients
+            .iter()
+            .position(|c| selector_matches(c.psk.as_bytes(), parts))
+    }
+
+    /// Hand an admitted datagram to quinn-proto and queue anything it emits.
+    fn feed(&mut self, now: Instant, from: SocketAddr, data: &[u8]) -> DatagramOutcome {
+        let mut resp = Vec::new();
+        let event = self
+            .inner
+            .handle(now, from, None, None, BytesMut::from(data), &mut resp);
+
+        // An endpoint-level response is queued ONLY for a server, where it can
+        // only ever target an admitted/active peer because junk never reaches
+        // this point. A CLIENT endpoint has no such guarantee — it feeds every
+        // datagram it receives — and quinn-proto's `handle` will happily produce
+        // a stateless reset for an unrecognized short-header packet. Answering
+        // one would turn the client into a fingerprinting oracle: an off-path
+        // prober could confirm "something QUIC-ish lives here" by eliciting a
+        // reply. A client has nothing legitimate to say at the endpoint level,
+        // so it says nothing.
+        if !resp.is_empty() && self.role == Role::Server {
+            self.outbound.push_back(Transmit {
+                destination: from,
+                contents: resp,
+            });
+        }
+
+        let outcome = match event {
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                // Unreachable for a client (quinn-proto only mints this with a
+                // server config installed), but accepting would be nonsense, so
+                // say so structurally rather than relying on that.
+                match self.role {
+                    Role::Server => self.admit(now, incoming),
+                    Role::Client => DatagramOutcome::Dropped,
+                }
+            }
+            Some(DatagramEvent::ConnectionEvent(ch, cev)) => {
+                if let Some(state) = self.connections.get_mut(&ch) {
+                    state.conn_mut().handle_event(cev);
+                }
+                DatagramOutcome::Accepted(ch)
+            }
+            // Some `Response`s DO mint a CID: quinn-proto's `initial_close`
+            // calls the CID generator for the close packet's source CID. No
+            // connection exists to attribute it to, which is exactly what the
+            // sweep below is for.
+            Some(DatagramEvent::Response(_)) | None => DatagramOutcome::Dropped,
+        };
+
+        // THE choke point. Every endpoint call that can mint a CID for this
+        // datagram has now happened — `inner.handle` above, and `inner.accept`
+        // inside `admit` — and `admit`'s success path has already attributed its
+        // CIDs to the connection it created. Anything still pending therefore
+        // belongs to no connection at all, so sweep it before anyone can
+        // mis-attribute it. Doing this HERE rather than at the end of
+        // `handle_datagram` matters: `service_connections` drains the pending
+        // queue on behalf of whichever connection it is servicing, so an orphan
+        // left in the queue would be handed to an unrelated connection.
+        self.sweep_orphan_cids();
+        outcome
+    }
+
+    /// Accept an admitted incoming connection and register it.
+    fn admit(&mut self, now: Instant, incoming: quinn_proto::Incoming) -> DatagramOutcome {
+        let mut buf = Vec::new();
+        match self.inner.accept(incoming, now, &mut buf, None) {
+            Ok((ch, conn)) => {
+                if !buf.is_empty() {
+                    self.outbound.push_back(Transmit {
+                        destination: conn.remote_address(),
+                        contents: buf,
+                    });
+                }
+                // `accept` minted this connection's initial CID(s) via the
+                // recorder; attribute them to `ch` for later pruning.
+                self.drain_pending_cids(ch);
+                self.connections.insert(ch, ConnState::new(conn));
+                DatagramOutcome::Accepted(ch)
+            }
+            Err(_) => {
+                // `accept` may produce an `initial_close` for an
+                // authenticated-but-refused peer (e.g. CID exhaustion). We
+                // deliberately DROP it: emitting zero bytes keeps silence
+                // strict, and the peer simply times out.
+                //
+                // It also leaves CIDs behind. quinn-proto mints `loc_cid`
+                // BEFORE the `handle_first_packet` whose failure produces this
+                // error, and `initial_close` mints a second one — both recorded
+                // by our generator, neither belonging to any connection. They
+                // are collected by the `sweep_orphan_cids` at the end of `feed`,
+                // which is why there is no drain call here: a drain needs a
+                // handle, and there is no connection to name.
+                DatagramOutcome::Dropped
+            }
+        }
+    }
+
+    /// Pump every connection: route endpoint events, service streams into
+    /// [`Event`]s, collect outbound datagrams, and reap connections that are
+    /// gone. This is the whole of the old tokio `drive_connections`, minus the
+    /// socket and the channels.
+    fn service_connections(&mut self, now: Instant) {
+        // Remembered as the "already elapsed" deadline `next_timeout` reports
+        // for a dirty connection. Recorded up front so it is correct even if
+        // this pass reaps everything.
+        self.last_service = Some(now);
+
+        let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+
+        // 1. Route connection→endpoint events (which may mint or retire CIDs).
+        //    Any CID minted by `handle_event` — a `NeedIdentifiers`-triggered
+        //    reissue for this connection — is attributed to `ch` via the pending
+        //    queue, immediately, while we still know who asked for it.
+        for ch in &handles {
+            while let Some(ev) = self
+                .connections
+                .get_mut(ch)
+                .and_then(|s| s.conn_mut().poll_endpoint_events())
+            {
+                let cev = self.inner.handle_event(*ch, ev);
+                self.drain_pending_cids(*ch);
+                if let Some(cev) = cev {
+                    if let Some(state) = self.connections.get_mut(ch) {
+                        state.conn_mut().handle_event(cev);
+                    }
+                }
+            }
+        }
+
+        // 2. Service application events and collect transmits. Staged into
+        //    locals because `self.connections` is borrowed for the whole loop.
+        let mut events: Vec<Event> = Vec::new();
+        let mut transmits: Vec<Transmit> = Vec::new();
+        let mut lost: Vec<ConnectionHandle> = Vec::new();
+
+        for ch in &handles {
+            let Some(state) = self.connections.get_mut(ch) else {
+                continue;
+            };
+
+            // `service_streams` is the SOLE `conn.poll()` caller.
+            let progress = state.service_streams();
+            if progress.connected {
+                events.push(Event::Connected(*ch));
+            }
+            for id in progress.opened {
+                events.push(Event::StreamOpened { conn: *ch, id });
+            }
+            for id in progress.readable {
+                events.push(Event::StreamReadable { conn: *ch, id });
+            }
+            for id in progress.writable {
+                events.push(Event::StreamWritable { conn: *ch, id });
+            }
+
+            // `progress.lost` alone is NOT enough, and this is the single most
+            // easily-lost line in the crate. A REMOTELY-initiated loss (a
+            // CONNECTION_CLOSE frame, a transport error, a stateless reset) sets
+            // quinn-proto's internal `error` field, so `poll()` yields
+            // `Event::ConnectionLost` and `progress.lost` catches it. A
+            // LOCALLY-initiated close does not: `Connection::close()` merely arms
+            // the close timer, and quinn-proto 0.11's `handle_timeout`/
+            // `Timer::Close` arm sets `state = State::Drained` and pushes
+            // `EndpointEventInner::Drained` WITHOUT ever touching `self.error` —
+            // so `poll()` never reports a self-close as lost. Left unreaped, that
+            // connection's state sits here forever even though quinn-proto's own
+            // slab has already freed and can reuse its `ConnectionHandle`; the
+            // eventual collision between a reused handle and stale bookkeeping
+            // wedges accept (reproducibly around ~32 cycles). `is_drained()` is
+            // quinn-proto's own signal that the terminal transition completed by
+            // EITHER path. Guarded by `tests/connection_lifecycle.rs` and by
+            // `a_locally_closed_connection_is_reaped_and_reports_connection_lost`
+            // in `proto/tests/core_endpoint.rs`.
+            if progress.lost || state.is_drained() {
+                lost.push(*ch);
+            }
+
+            // Drain outbound datagrams. One datagram per `poll_transmit`
+            // (`max_datagrams = 1`), so `buf` holds exactly one each time.
+            let mut buf = Vec::new();
+            while let Some(t) = state.conn_mut().poll_transmit(now, 1, &mut buf) {
+                if buf.is_empty() {
+                    break;
+                }
+                transmits.push(Transmit {
+                    destination: t.destination,
+                    contents: std::mem::take(&mut buf),
+                });
+            }
+
+            // Everything the caller's stream operations produced — bytes, FIN,
+            // RESET_STREAM, STOP_SENDING, and the MAX_STREAM_DATA/MAX_DATA
+            // credit a read released — is now in `transmits`. The connection is
+            // clean until the caller touches a stream again.
+            state.clear_dirty();
+        }
+
+        self.events.extend(events);
+        self.outbound.extend(transmits);
+
+        // 3. Reap. This happens AFTER the transmit drain above, so a closing
+        //    connection's CONNECTION_CLOSE is already queued for the caller.
+        for ch in lost {
+            if self.connections.remove(&ch).is_some() {
+                // The only place a CID leaves the routing set, and it runs
+                // strictly after the connection is gone, so no live CID is ever
+                // removed.
+                self.prune_connection_cids(ch);
+                // Emitted for BOTH loss paths, including a self-close that
+                // quinn-proto never reported: from the caller's point of view
+                // the handle is dead either way, and this is how it finds out.
+                self.events.push_back(Event::ConnectionLost { conn: ch });
+            }
+        }
+
+        // 4. Backstop. Every mint site above is followed immediately by its own
+        //    `drain_pending_cids`, so in normal operation this is a no-op. It
+        //    exists so that a pass can NEVER end with an unattributed CID: if a
+        //    future quinn-proto mints somewhere we do not drain, the CID is
+        //    swept rather than left to leak and to be mis-attributed to whatever
+        //    connection the next drain happens to name.
+        self.sweep_orphan_cids();
+
+        self.refresh_next_timeout();
+    }
+
+    /// Recompute the cached earliest deadline across all live connections.
+    fn refresh_next_timeout(&mut self) {
+        self.next_timeout = self
+            .connections
+            .values_mut()
+            .filter_map(|s| s.conn_mut().poll_timeout())
+            .min();
+    }
+
+    /// Move every CID the recorder minted since the last drain into `ch`'s
+    /// owned-CID list.
+    ///
+    /// Called immediately after each endpoint call that can mint (`connect`,
+    /// `accept`, per-handle `handle_event`), so the pending queue only ever
+    /// holds CIDs freshly minted for `ch`. Deferring this — or, as the spike
+    /// did, merely `clear()`ing the queue — leaves the CID unattributed, which
+    /// means it can never be pruned and routes to nothing forever.
+    fn drain_pending_cids(&mut self, ch: ConnectionHandle) {
+        let drained: Vec<ConnectionId> = {
+            let mut pending = self.pending_cids.lock().expect("pending_cids poisoned");
+            if pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *pending)
+        };
+        self.cids_by_conn.entry(ch).or_default().extend(drained);
+    }
+
+    /// Discard every CID that is still pending, as belonging to no connection.
+    ///
+    /// A CID reaches the pending queue the instant quinn-proto mints it, and
+    /// every mint that belongs to a connection is attributed by the
+    /// [`Endpoint::drain_pending_cids`] that immediately follows its minting
+    /// call. So a CID still pending when a pass reaches a sweep point was minted
+    /// for a connection that never came into existence — `Endpoint::accept`
+    /// mints `loc_cid` *before* the `handle_first_packet` whose failure returns
+    /// `AcceptError`, and then `initial_close` mints another; the same is true
+    /// of the `initial_close` behind a `DatagramEvent::Response`.
+    ///
+    /// Leaving such a CID alone is doubly wrong: in `issued_cids` it leaks
+    /// (unbounded growth, triggerable at will by any PSK holder whose
+    /// ClientHello fails) and makes `is_active_dcid` answer true for a
+    /// connection that does not exist, letting a packet bypass the pre-filter;
+    /// in `pending_cids` the next `drain_pending_cids(ch)` misattributes it to
+    /// an unrelated connection `ch`, corrupting `cids_by_conn`.
+    ///
+    /// This can never take a live connection's CID, because there is no window
+    /// in which a live connection's CID is pending and unattributed: `connect`,
+    /// `accept`'s success path and `handle_event` each drain in the very next
+    /// statement, before any sweep point is reached.
+    fn sweep_orphan_cids(&mut self) {
+        let orphans =
+            std::mem::take(&mut *self.pending_cids.lock().expect("pending_cids poisoned"));
+        if orphans.is_empty() {
+            return;
+        }
+        let mut set = self.issued_cids.lock().expect("issued_cids poisoned");
+        for cid in orphans {
+            set.remove(&cid);
+        }
+    }
+
+    /// Remove all of a lost connection's CIDs from the routing set. Safe because
+    /// the connection has already been reaped, so none of these CIDs can route
+    /// to a live connection. Leaks nothing: the per-connection list goes too.
+    fn prune_connection_cids(&mut self, ch: ConnectionHandle) {
+        if let Some(cids) = self.cids_by_conn.remove(&ch) {
+            let mut set = self.issued_cids.lock().expect("issued_cids poisoned");
+            for cid in cids {
+                set.remove(&cid);
+            }
+        }
+    }
+}
+
+/// Read the DCID from either header form.
+///
+/// Long headers carry an explicit DCID length; short headers do not, so we read
+/// exactly [`LOCAL_CID_LEN`] (we only route short-header packets to connections
+/// we created, so that is the only length that can match).
+fn read_dcid_any(data: &[u8]) -> Option<&[u8]> {
+    let first = *data.first()?;
+    if first & 0x80 != 0 {
+        peek_dcid(data) // long header
+    } else {
+        data.get(1..1 + LOCAL_CID_LEN) // short header: [flags][dcid(LOCAL_CID_LEN)]...
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Needed in scope to mint CIDs directly from the recorder.
+    use quinn_proto::{ConnectionIdGenerator, Side};
+
+    /// A server endpoint with no authorized clients: enough to exercise the CID
+    /// bookkeeping without a handshake.
+    fn bare_server() -> Endpoint {
+        let secrets: ServerSecrets =
+            toml::from_str("listen = \"127.0.0.1:0\"\nclients = []\n").expect("parse secrets");
+        Endpoint::new_server(secrets).expect("server endpoint")
+    }
+
+    /// Simulate the endpoint minting CIDs for a connection by running a recorder
+    /// wired to the same shared state the real generator uses. Callers then call
+    /// `drain_pending_cids` exactly as the endpoint does after `accept` /
+    /// `handle_event`.
+    fn mint_for(ep: &Endpoint, count: usize) -> Vec<ConnectionId> {
+        let mut generator = RecordingCidGenerator::new(
+            LOCAL_CID_LEN,
+            ep.issued_cids.clone(),
+            ep.pending_cids.clone(),
+        );
+        (0..count).map(|_| generator.generate_cid()).collect()
+    }
+
+    #[test]
+    fn recorder_populates_routing_set_and_pending_queue() {
+        let ep = bare_server();
+        let cids = mint_for(&ep, 3);
+
+        let set = ep.issued_cids.lock().unwrap();
+        for cid in &cids {
+            assert!(set.contains(cid), "a minted CID must route");
+        }
+        drop(set);
+        assert_eq!(
+            *ep.pending_cids.lock().unwrap(),
+            cids,
+            "and be queued for attribution, in mint order"
+        );
+    }
+
+    #[test]
+    fn drain_attributes_minted_cids_to_the_connection_being_serviced() {
+        let mut ep = bare_server();
+        let live = ConnectionHandle(1);
+        let doomed = ConnectionHandle(2);
+
+        let live_cids = mint_for(&ep, 2);
+        ep.drain_pending_cids(live);
+        let doomed_cids = mint_for(&ep, 3);
+        ep.drain_pending_cids(doomed);
+
+        assert!(
+            ep.pending_cids.lock().unwrap().is_empty(),
+            "the pending queue is fully drained after attribution"
+        );
+        assert_eq!(ep.cids_by_conn[&live], live_cids);
+        assert_eq!(ep.cids_by_conn[&doomed], doomed_cids);
+        assert_eq!(ep.issued_cid_count(), 5);
+    }
+
+    #[test]
+    fn prune_removes_only_the_lost_connections_cids() {
+        let mut ep = bare_server();
+        let live = ConnectionHandle(1);
+        let doomed = ConnectionHandle(2);
+
+        let live_cids = mint_for(&ep, 2);
+        ep.drain_pending_cids(live);
+        let doomed_cids = mint_for(&ep, 3);
+        ep.drain_pending_cids(doomed);
+
+        ep.prune_connection_cids(doomed);
+
+        let set = ep.issued_cids.lock().unwrap();
+        for cid in &live_cids {
+            assert!(set.contains(cid), "a live connection's CID is never pruned");
+        }
+        for cid in &doomed_cids {
+            assert!(!set.contains(cid), "a lost connection's CID is pruned");
+        }
+        assert_eq!(set.len(), 2);
+        drop(set);
+        assert!(
+            !ep.cids_by_conn.contains_key(&doomed),
+            "the per-connection list goes too — no leak"
+        );
+    }
+
+    #[test]
+    fn pruning_an_unknown_handle_is_a_noop() {
+        let mut ep = bare_server();
+        let cids = mint_for(&ep, 2);
+        ep.drain_pending_cids(ConnectionHandle(1));
+
+        ep.prune_connection_cids(ConnectionHandle(99));
+
+        let set = ep.issued_cids.lock().unwrap();
+        for cid in &cids {
+            assert!(set.contains(cid));
+        }
+        assert_eq!(set.len(), 2);
+    }
+
+    /// An endpoint with no connections has no deadline, and asking for one must
+    /// not invent work.
+    #[test]
+    fn an_idle_endpoint_has_no_timeout_and_nothing_to_send() {
+        let mut ep = bare_server();
+        let now = Instant::now();
+        assert_eq!(ep.next_timeout(), None);
+        assert!(ep.poll_transmit(now).is_none());
+        assert!(ep.poll_event().is_none());
+        assert_eq!(ep.next_timeout(), None);
+    }
+
+    // -- orphaned-CID sweep -------------------------------------------------
+
+    /// The sweep's contract in isolation: it discards exactly the CIDs that no
+    /// `drain_pending_cids` claimed, and cannot touch one that was claimed.
+    ///
+    /// The orphans here stand in for what `quinn_proto::Endpoint::accept` leaves
+    /// behind when it fails: `loc_cid`, minted before the `handle_first_packet`
+    /// that errors, plus the `initial_close` source CID minted on the way out.
+    #[test]
+    fn sweep_discards_orphans_and_leaves_attributed_cids_alone() {
+        let mut ep = bare_server();
+        let live = ConnectionHandle(1);
+
+        let live_cids = mint_for(&ep, 2);
+        ep.drain_pending_cids(live);
+
+        // A failed accept: two CIDs minted, no connection, no drain.
+        let orphans = mint_for(&ep, 2);
+        assert_eq!(ep.issued_cid_count(), 4, "all four were recorded");
+
+        ep.sweep_orphan_cids();
+
+        let set = ep.issued_cids.lock().unwrap();
+        for cid in &orphans {
+            assert!(
+                !set.contains(cid),
+                "an unattributed CID must not survive the pass: in `issued_cids` it \
+                 leaks and makes `is_active_dcid` true for a connection that does \
+                 not exist"
+            );
+        }
+        for cid in &live_cids {
+            assert!(
+                set.contains(cid),
+                "the sweep must never steal a CID a drain already attributed"
+            );
+        }
+        assert_eq!(set.len(), 2, "back to the live connection's baseline");
+        drop(set);
+
+        assert!(
+            ep.pending_cids.lock().unwrap().is_empty(),
+            "and the pending queue is empty, so the NEXT drain cannot misattribute"
+        );
+        assert_eq!(
+            ep.cids_by_conn[&live], live_cids,
+            "the live connection's attribution is untouched"
+        );
+    }
+
+    /// The guard that matters: after a servicing pass, `issued_cid_count()` is
+    /// back to the live connection's baseline — and that connection still works.
+    ///
+    /// Orphans are injected into the recorder's shared state exactly as a failed
+    /// `Endpoint::accept` would leave them (recorded in `issued_cids`, still at
+    /// the head of `pending_cids`, attributed to nobody), because forcing a real
+    /// `handle_first_packet` failure would mean hand-forging a PSK-sealed
+    /// Initial that decrypts and *then* violates the transport. What is being
+    /// guarded is the endpoint's response to that state, and this reproduces it
+    /// faithfully.
+    #[test]
+    fn a_servicing_pass_returns_issued_cids_to_baseline_after_orphans_appear() {
+        let mut pair = crate::testing::connected_pair();
+        let now = pair.now();
+
+        let baseline = pair.server().issued_cid_count();
+        assert!(baseline > 0, "the live connection has CIDs");
+        let live_cids: HashSet<ConnectionId> = pair
+            .server()
+            .issued_cids
+            .lock()
+            .expect("issued_cids poisoned")
+            .clone();
+
+        let orphans = mint_for(pair.server(), 2);
+        assert_eq!(pair.server().issued_cid_count(), baseline + 2);
+
+        // One ordinary servicing pass — the caller draining transmits to `None`.
+        while pair.server().poll_transmit(now).is_some() {}
+
+        assert_eq!(
+            pair.server().issued_cid_count(),
+            baseline,
+            "a pass must not end with CIDs belonging to no connection; unswept, \
+             every failed accept grows this set forever"
+        );
+        let set = pair
+            .server()
+            .issued_cids
+            .lock()
+            .expect("issued_cids poisoned")
+            .clone();
+        for cid in &orphans {
+            assert!(!set.contains(cid), "the orphans are gone");
+        }
+        for cid in &live_cids {
+            assert!(
+                set.contains(cid),
+                "the live connection's CIDs are NOT collateral — they must still route"
+            );
+        }
+        assert!(
+            pair.server()
+                .pending_cids
+                .lock()
+                .expect("pending_cids poisoned")
+                .is_empty(),
+            "and nothing is left for the next drain to misattribute"
+        );
+
+        // The strongest statement that no live CID was stolen: the connection
+        // still carries a stream end to end.
+        let id = pair.open_bi(Side::Client);
+        pair.write_all(Side::Client, id, b"still-routing");
+        pair.conn(Side::Client).stream_finish(id).expect("finish");
+        pair.drive();
+        assert_eq!(pair.accept_bi(Side::Server), id);
+        assert_eq!(&pair.pump_until_read(Side::Server, id), b"still-routing");
+    }
+
+    // -- what `Dropped` does and does not promise ---------------------------
+
+    /// A server whose only authorized client is [`VN_PSK_HEX`].
+    fn psk_server() -> (Endpoint, [u8; 32]) {
+        let secrets: ServerSecrets = toml::from_str(&format!(
+            "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id = \"a\"\npsk = \"{VN_PSK_HEX}\"\n"
+        ))
+        .expect("parse secrets");
+        let psk = *secrets.clients[0].psk.as_bytes();
+        (Endpoint::new_server(secrets).expect("server endpoint"), psk)
+    }
+
+    const VN_PSK_HEX: &str = "000000000000000000000000000000000000000000000000000000000000002a";
+
+    /// `DatagramOutcome::Dropped` does NOT mean "nothing was queued", and the
+    /// silence invariant does not claim it does.
+    ///
+    /// The pre-filter is QUIC-version-agnostic by construction — it reads the
+    /// DCID out of the long header and never looks at the version — so a peer
+    /// holding a valid PSK can present a well-formed selector with a version we
+    /// do not speak. quinn-proto answers with Version Negotiation: bytes queued,
+    /// no connection created, outcome `Dropped`.
+    ///
+    /// This is not a silence violation (that peer proved PSK possession before a
+    /// single byte was queued) and the fix is not to suppress the reply; it is
+    /// that the invariant is about **pre-filter rejection**, which is what
+    /// `core_silence.rs` actually tests. This test exists so the documented
+    /// carve-out cannot quietly become false in either direction.
+    #[test]
+    fn an_authorized_peer_on_an_unsupported_version_is_dropped_but_answered() {
+        let (mut ep, psk) = psk_server();
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let dcid = build_dcid(&psk, [0x11; 8], now_minutes());
+        let mut pkt = vec![0xc0];
+        pkt.extend_from_slice(&0xdead_beefu32.to_be_bytes()); // not a version we speak
+        pkt.push(DCID_LEN as u8);
+        pkt.extend_from_slice(&dcid);
+        pkt.push(0); // zero-length SCID
+        pkt.extend_from_slice(&[0u8; 1200]);
+
+        assert_eq!(
+            ep.handle_datagram(now, peer, &pkt),
+            DatagramOutcome::Dropped,
+            "no connection was created, so the outcome is Dropped"
+        );
+        assert!(
+            ep.poll_transmit(now).is_some(),
+            "...and yet bytes WERE queued (Version Negotiation). `Dropped` promises \
+             only 'no connection for you'; the silence invariant is about a datagram \
+             that FAILS THE PRE-FILTER, and this one passed it."
+        );
+        assert_eq!(
+            ep.issued_cid_count(),
+            0,
+            "the response path must leave no CID behind either"
+        );
+    }
+}

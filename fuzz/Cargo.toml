@@ -1,0 +1,33 @@
+[package]
+name = "silentquic-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "0BSD"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.silentquic]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_dcid"
+path = "fuzz_targets/parse_dcid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peek_dcid"
+path = "fuzz_targets/peek_dcid.rs"
+test = false
+doc = false
+bench = false
