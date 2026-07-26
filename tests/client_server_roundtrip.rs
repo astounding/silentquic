@@ -144,6 +144,45 @@ async fn stream_echo_roundtrips_over_udp() {
     assert_eq!(&server_got, b"ping", "server must have received the ping");
 }
 
+#[tokio::test]
+async fn split_stream_reads_incrementally_before_fin() {
+    let psk_hex = "0000000000000000000000000000000000000000000000000000000000000009";
+    let secrets: ServerSecrets = toml::from_str(&format!(
+        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+    ))
+    .unwrap();
+    let mut server = Server::bind(secrets).await.unwrap();
+    let addr = server.local_addr();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("server accepts");
+        let stream = conn.accept_stream().await.expect("server accepts stream");
+        let (mut recv, mut send) = stream.split();
+        let first = recv.read(3).await.expect("incremental read");
+        assert_eq!(first, b"abc");
+        send.write_all(b"seen").await.expect("concurrent response");
+        send.finish().await.expect("finish response");
+        let second = recv.read(3).await.expect("read after response");
+        assert_eq!(second, b"def");
+        assert!(recv.read(3).await.expect("read FIN").is_empty());
+    });
+
+    let cfg: ClientConfigFile = toml::from_str(&format!(
+        "client_id=\"a\"\npsk=\"{psk_hex}\"\nserver=\"{addr}\"\n"
+    ))
+    .unwrap();
+    let conn = Client::connect(cfg).await.unwrap();
+    let stream = conn.open_stream().await.unwrap();
+    let (mut recv, mut send) = stream.split();
+    send.write_all(b"abc").await.unwrap();
+    let response = recv.read(16).await.unwrap();
+    assert_eq!(response, b"seen");
+    send.write_all(b"def").await.unwrap();
+    send.finish().await.unwrap();
+    assert!(recv.read(16).await.unwrap().is_empty());
+    server_task.await.unwrap();
+}
+
 /// The client can pin its local source address/port.
 ///
 /// Default is an ephemeral port on any interface (what ordinary QUIC clients

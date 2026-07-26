@@ -11,11 +11,12 @@ Known limitations and the threat boundary are documented in [README.md](README.m
 
 ## Planned work
 
-- Add incremental reads and `AsyncRead`/`AsyncWrite`-style split stream APIs.
+- Add standard `AsyncRead`/`AsyncWrite` trait implementations around the
+  incremental split stream handles.
 - Make `read_to_end` require a size limit and implement it over incremental
   reads.
-- Delete the Tokio layer's bespoke parked-read machinery once incremental
-  reads exist.
+- Delete the Tokio layer's bespoke `read_to_end` accumulator once the bounded
+  convenience is implemented over incremental reads.
 - Consider configurable reject-path rate limits and improved early-flight loss
   recovery without weakening replay silence.
 - Consider a C FFI over `silentquic-proto`.

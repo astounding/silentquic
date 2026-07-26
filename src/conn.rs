@@ -119,6 +119,13 @@ pub(crate) enum Cmd {
         id: StreamId,
         reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
     },
+    /// Read up to `max` bytes, completing as soon as any data or FIN is
+    /// available. An empty vector means clean end-of-stream.
+    Read {
+        id: StreamId,
+        max: usize,
+        reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
+    },
     /// Close the connection with an application error code, sending a
     /// CONNECTION_CLOSE frame so the peer (and this side's driver) tear down
     /// promptly rather than waiting out the idle timeout.
@@ -309,6 +316,82 @@ impl Stream {
             .await?;
         rx.await.map_err(|_| ConnError::Closed)?
     }
+
+    /// Read up to `max` bytes. Returns an empty vector after clean FIN.
+    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>, ConnError> {
+        read_chunk(&self.cmds, self.id, max).await
+    }
+
+    /// Split this bidirectional stream into independently movable receive and
+    /// send handles so callers can relay both directions concurrently.
+    pub fn split(self) -> (RecvStream, SendStream) {
+        (
+            RecvStream {
+                id: self.id,
+                cmds: self.cmds.clone(),
+            },
+            SendStream {
+                id: self.id,
+                cmds: self.cmds,
+            },
+        )
+    }
+}
+
+/// Receive half of a split bidirectional stream.
+pub struct RecvStream {
+    id: StreamId,
+    cmds: CmdSender,
+}
+
+impl RecvStream {
+    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>, ConnError> {
+        read_chunk(&self.cmds, self.id, max).await
+    }
+}
+
+/// Send half of a split bidirectional stream.
+pub struct SendStream {
+    id: StreamId,
+    cmds: CmdSender,
+}
+
+impl SendStream {
+    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), ConnError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Write {
+                id: self.id,
+                data: buf.to_vec(),
+                reply: tx,
+            })
+            .await?;
+        rx.await.map_err(|_| ConnError::Closed)?
+    }
+
+    pub async fn finish(&mut self) -> Result<(), ConnError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Finish {
+                id: self.id,
+                reply: tx,
+            })
+            .await?;
+        rx.await.map_err(|_| ConnError::Closed)?
+    }
+}
+
+async fn read_chunk(
+    cmds: &CmdSender,
+    id: StreamId,
+    max: usize,
+) -> Result<Vec<u8>, ConnError> {
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let (tx, rx) = oneshot::channel();
+    cmds.send(Cmd::Read { id, max, reply: tx }).await?;
+    rx.await.map_err(|_| ConnError::Closed)?
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +417,7 @@ struct PendingWrite {
 /// channel to fire once FIN (or a reset) is seen.
 struct PendingRead {
     buf: Vec<u8>,
+    max: Option<usize>,
     reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
 }
 
@@ -405,6 +489,17 @@ impl Parked {
             Cmd::ReadToEnd { id, reply } => {
                 let mut pending = PendingRead {
                     buf: Vec::new(),
+                    max: None,
+                    reply,
+                };
+                if !Self::pump_read(core, id, &mut pending) {
+                    self.pending_reads.insert(id, pending);
+                }
+            }
+            Cmd::Read { id, max, reply } => {
+                let mut pending = PendingRead {
+                    buf: Vec::new(),
+                    max: Some(max.max(1)),
                     reply,
                 };
                 if !Self::pump_read(core, id, &mut pending) {
@@ -525,10 +620,22 @@ impl Parked {
             // Read straight into the tail of the accumulator, so a large
             // transfer costs no per-chunk allocation and no extra copy.
             let filled = pending.buf.len();
-            pending.buf.resize(filled + READ_CHUNK, 0);
+            let request = pending
+                .max
+                .map(|max| max.saturating_sub(filled).min(READ_CHUNK))
+                .unwrap_or(READ_CHUNK);
+            pending.buf.resize(filled + request, 0);
             let outcome = core.stream_read(id, &mut pending.buf[filled..]);
             match outcome {
-                Ok(ReadOutcome::Read(n)) => pending.buf.truncate(filled + n),
+                Ok(ReadOutcome::Read(n)) => {
+                    pending.buf.truncate(filled + n);
+                    if pending.max.is_some() {
+                        let buf = std::mem::take(&mut pending.buf);
+                        let reply = replace_reply_read(&mut pending.reply);
+                        let _ = reply.send(Ok(buf));
+                        return true;
+                    }
+                }
                 Ok(ReadOutcome::Blocked) => {
                     pending.buf.truncate(filled);
                     return false;
@@ -543,7 +650,9 @@ impl Parked {
                     // connection carrying many short-lived streams and keeps
                     // this crate's pre-core behaviour (a second `read_to_end`
                     // on a drained stream is an error).
-                    core.forget_stream(id);
+                    if pending.max.is_none() {
+                        core.forget_stream(id);
+                    }
                     let buf = std::mem::take(&mut pending.buf);
                     let reply = replace_reply_read(&mut pending.reply);
                     let _ = reply.send(Ok(buf));

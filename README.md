@@ -206,12 +206,10 @@ discovering them under load.
    not tuned for high fan-out (hundreds+ of simultaneous connections on one
    server).
 2. **`Stream::read_to_end` buffers the entire stream in memory, unbounded.**
-   A post-authentication peer that opens a stream and sends an unbounded
-   amount of data can exhaust server memory. There is no bounded/chunked read
-   API yet — that's future work. This is fine for today's intended use
-   (control messages and bounded-size payloads) but callers moving large,
-   attacker-influenced payloads over `silentquic` should not rely on
-   `read_to_end` as-is.
+   A post-authentication peer that sends an unbounded amount of data can exhaust
+   memory if a caller uses this convenience. Interactive or untrusted-size
+   applications must use bounded `Stream::read(max)` or split the stream into
+   its independent receive/send handles and read incrementally.
 3. **Rate-limit parameters are compile-time constants**, not yet configurable
    via TOML. The per-source and global buckets that bound the unauthenticated
    pre-filter's CPU cost (see Threat Model, resource side-channel) cannot

@@ -65,11 +65,13 @@ Several implementation bugs established durable invariants:
 ## Stream API decision
 
 The original Tokio API exposed only unbounded `read_to_end`, which both risks
-memory exhaustion and forced bespoke parked-read state. The planned replacement
-uses incremental `read` as the primitive, implements async read/write traits,
-and offers `read_to_end(limit)` only as a bounded convenience. Once incremental
-reads land, the parked-read machinery should be deleted rather than maintained
-as a second path. The sans-I/O core already has the correct incremental model.
+memory exhaustion and forced bespoke parked-read state. Incremental bounded
+`read(max)` and split receive/send handles were added when `squicusock` needed
+interactive full-duplex forwarding. The remaining direction is to implement
+standard async read/write traits and offer `read_to_end(limit)` only as a
+bounded convenience. The old accumulator should then be deleted rather than
+maintained as a second path. The sans-I/O core already has the correct
+incremental model.
 
 ## Validation record
 
