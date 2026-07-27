@@ -40,7 +40,11 @@ pub fn parse_dcid(dcid: &[u8]) -> Option<DcidParts> {
     let freshness = u32::from_le_bytes(dcid[8..12].try_into().ok()?);
     let mut selector = [0u8; 8];
     selector.copy_from_slice(&dcid[12..20]);
-    Some(DcidParts { nonce, freshness, selector })
+    Some(DcidParts {
+        nonce,
+        freshness,
+        selector,
+    })
 }
 
 pub fn selector_matches(psk: &[u8; 32], parts: &DcidParts) -> bool {

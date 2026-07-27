@@ -9,9 +9,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy }
-      - run: cargo test --all
-      - run: cargo clippy --all --all-targets -- -D warnings
+        with: { components: clippy, rustfmt }
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      - run: cargo package -p silentquic-proto
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        if: matrix.os == 'ubuntu-latest'
+      # The wrapper can be verified only after this exact proto version exists
+      # in the registry. The release checklist performs that ordered step.
       # The sans-IO core must stay drivable from a hand-rolled event loop, and
       # the reference loop is documentation people copy — so it is compiled and
       # RUN here, not merely built.
@@ -31,5 +39,6 @@ jobs:
           # build fails with an unobvious error without it.
           prepare: pkg install -y rust cmake
           run: |
-            cargo test --all
+            cargo test --workspace --all-targets
+            cargo test --workspace --doc
             cargo run -p silentquic-proto --example poll_loop

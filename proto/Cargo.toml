@@ -1,10 +1,16 @@
 [package]
 name = "silentquic-proto"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
+rust-version = "1.88"
 license = "0BSD"
 description = "Sans-IO core for silentquic: cloaked QUIC protocol state machine with no I/O, no runtime, and no threads."
-repository = ""
+documentation = "https://docs.rs/silentquic-proto"
+repository = "https://github.com/astounding/silentquic"
+homepage = "https://github.com/astounding/silentquic"
+readme = "../README.md"
+keywords = ["quic", "transport", "psk", "sans-io", "privacy"]
+categories = ["network-programming", "cryptography"]
 
 # NOTE: there is deliberately NO `tokio` dependency here, and none may be added.
 # This crate performs no I/O, spawns nothing, and never blocks, so that callers
@@ -19,7 +25,7 @@ hex = "0.4"
 # HmacKey/HandshakeTokenKey impls line up with our aws-lc-rs primitives and the
 # whole crypto stack shares one backend.
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log", "bloom"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

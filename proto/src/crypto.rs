@@ -176,8 +176,8 @@ impl SelfSigned {
 /// [`crate::initial_keys::PskClientConfig`] wraps the returned config to
 /// override *only* the Initial packet keys; everything after the Initial is
 /// ordinary TLS 1.3.
-pub fn quic_client_config() -> Result<Arc<QuicClientConfig>, Box<dyn std::error::Error + Send + Sync>>
-{
+pub fn quic_client_config(
+) -> Result<Arc<QuicClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?

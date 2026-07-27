@@ -12,9 +12,9 @@
 //!
 //! # The pump
 //!
-//! [`Driver::run`] is one `select!` over four wakeups — an inbound datagram, a
+//! `Driver::run` is one `select!` over four wakeups — an inbound datagram, a
 //! handle command, the connection timer, and accept-channel capacity — and each
-//! one is a single call into the core. Between wakeups, [`Driver::pump`] drains
+//! one is a single call into the core. Between wakeups, `Driver::pump` drains
 //! the core in the order [`silentquic_proto::endpoint`] documents, **which is
 //! load-bearing**:
 //!
@@ -50,8 +50,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use quinn_proto::ConnectionHandle;
 use silentquic_proto::endpoint::Endpoint as Core;
+use silentquic_proto::outcome::ConnectionHandle;
 use silentquic_proto::outcome::Event as CoreEvent;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -349,6 +349,7 @@ impl Driver {
         if !self.surfaced.insert(ch) {
             return;
         }
+        let client_id = self.core.client_id(ch).map(str::to_owned);
         let Some(state) = self.core.conn_mut(ch) else {
             self.surfaced.remove(&ch);
             return;
@@ -357,7 +358,7 @@ impl Driver {
         self.parked.insert(ch, Parked::default());
         let cmds = CmdSender::new(ch, self.cmd_tx.clone());
         self.pending_accept
-            .push_back(Connection::new(ch, remote, cmds));
+            .push_back(Connection::new(ch, remote, client_id, cmds));
     }
 
     /// A connection is gone. **Every** retained copy of its handle is dropped
@@ -451,8 +452,12 @@ mod tests {
         // Connections B and C connect but are NEVER accepted. B will occupy the
         // size-1 channel; C must queue in `pending_accept` awaiting a permit.
         // (Old blocking code would stall the driver here — including A.)
-        let client_b = Client::connect(mk_cfg()).await.expect("client B handshakes");
-        let client_c = Client::connect(mk_cfg()).await.expect("client C handshakes");
+        let client_b = Client::connect(mk_cfg())
+            .await
+            .expect("client B handshakes");
+        let client_c = Client::connect(mk_cfg())
+            .await
+            .expect("client C handshakes");
 
         // Give the driver time to surface B and C (one into the full channel, one
         // into pending_accept) without us accepting them.
@@ -465,26 +470,39 @@ mod tests {
         a_stream.write_all(b"still-alive").await.expect("A writes");
         a_stream.finish().await.expect("A finishes");
 
-        let mut srv_stream = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            conn_a.accept_stream(),
-        )
-        .await
-        .expect("server servicing A must not be frozen by a full accept channel")
-        .expect("server accepts A's stream");
-        let got = srv_stream.read_to_end().await.expect("server reads A's stream");
-        assert_eq!(&got, b"still-alive", "A's stream data must flow while B/C wait");
-        srv_stream.write_all(&got).await.expect("server echoes to A");
-        srv_stream.finish().await.expect("server finishes echo to A");
+        let mut srv_stream =
+            tokio::time::timeout(std::time::Duration::from_secs(10), conn_a.accept_stream())
+                .await
+                .expect("server servicing A must not be frozen by a full accept channel")
+                .expect("server accepts A's stream");
+        let got = srv_stream
+            .read_to_end(1024)
+            .await
+            .expect("server reads A's stream");
+        assert_eq!(
+            &got, b"still-alive",
+            "A's stream data must flow while B/C wait"
+        );
+        srv_stream
+            .write_all(&got)
+            .await
+            .expect("server echoes to A");
+        srv_stream
+            .finish()
+            .await
+            .expect("server finishes echo to A");
 
         let echo = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            a_stream.read_to_end(),
+            a_stream.read_to_end(1024),
         )
         .await
         .expect("A's echo read must not time out")
         .expect("A reads the echo");
-        assert_eq!(&echo, b"still-alive", "A round-trips while B/C sit undelivered");
+        assert_eq!(
+            &echo, b"still-alive",
+            "A round-trips while B/C sit undelivered"
+        );
 
         // And no connection was dropped or double-delivered: draining accept()
         // now must still yield B and C (two distinct connections), proving the

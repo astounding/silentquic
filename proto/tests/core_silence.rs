@@ -49,7 +49,10 @@ fn empty_datagram_is_dropped_and_queues_no_transmit() {
     let mut ep = server();
     let now = Instant::now();
 
-    assert_eq!(ep.handle_datagram(now, peer(), &[]), DatagramOutcome::Dropped);
+    assert_eq!(
+        ep.handle_datagram(now, peer(), &[]),
+        DatagramOutcome::Dropped
+    );
     assert_silent(&mut ep, now, "empty");
 }
 

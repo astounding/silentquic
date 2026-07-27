@@ -61,7 +61,10 @@ fn client_stream_is_accepted_and_read_by_the_server() {
     pair.drive();
 
     let accepted = pair.accept_bi(Side::Server);
-    assert_eq!(accepted, id, "the server accepts the stream the client opened");
+    assert_eq!(
+        accepted, id,
+        "the server accepts the stream the client opened"
+    );
 
     let got = pair.pump_until_read(Side::Server, id);
     assert_eq!(&got, b"ping", "every byte survived the cloaked round trip");

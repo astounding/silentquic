@@ -13,7 +13,7 @@
 //!
 //! This module is deliberately transport-agnostic: the server driver
 //! ([`crate::server`]) and the client driver ([`crate::client`]) both translate
-//! the same [`Cmd`]s, so the stream plumbing is written once and lives in
+//! the same `Cmd`s, so the stream plumbing is written once and lives in
 //! neither `server.rs` nor `client.rs`.
 //!
 //! # Why the *parking* lives here and not in the core
@@ -21,11 +21,11 @@
 //! `silentquic_proto` is sans-IO: it cannot wait for anything, so its
 //! `ConnState::stream_read` answers `Read(n)` / `Blocked` / `Finished` right
 //! now and never completes later. But this crate's public API promises
-//! `Stream::read_to_end().await` — a call that *does* complete later. The
-//! difference between those two shapes is exactly [`Parked`]: the map of handle
+//! `Stream::read_to_end(limit).await` — a call that *does* complete later. The
+//! difference between those two shapes is exactly `Parked`: the map of handle
 //! operations that have been offered to the core, come back `Blocked`, and are
 //! now waiting for the [`silentquic_proto::outcome::Event`] that says "try
-//! again". The driver owns one [`Parked`] per live connection and services it
+//! again". The driver owns one `Parked` per live connection and services it
 //! from its event dispatch; the core stays free of channels and runtimes.
 //!
 //! # Forward-compat seam ([`Connection::quinn_connection`])
@@ -45,7 +45,7 @@ use std::time::Instant;
 
 use quinn_proto::StreamId;
 use silentquic_proto::conn::ConnState as CoreConn;
-use silentquic_proto::outcome::{ReadOutcome, WriteOutcome};
+use silentquic_proto::outcome::{ConnectionHandle, ReadOutcome, WriteOutcome};
 use tokio::sync::{mpsc, oneshot};
 
 /// Errors surfaced by [`Connection`] and [`Stream`] operations.
@@ -61,7 +61,7 @@ pub use silentquic_proto::conn::ConnError;
 /// to the matching [`ConnState`] by `handle`. (The server owns many connections;
 /// the client owns one — the same channel shape serves both.)
 pub(crate) struct Tagged {
-    pub(crate) handle: quinn_proto::ConnectionHandle,
+    pub(crate) handle: ConnectionHandle,
     pub(crate) cmd: Cmd,
 }
 
@@ -70,12 +70,12 @@ pub(crate) struct Tagged {
 /// connection's [`Connection`] / [`Stream`] / [`QuinnHandle`] handles.
 #[derive(Clone)]
 pub(crate) struct CmdSender {
-    handle: quinn_proto::ConnectionHandle,
+    handle: ConnectionHandle,
     tx: mpsc::Sender<Tagged>,
 }
 
 impl CmdSender {
-    pub(crate) fn new(handle: quinn_proto::ConnectionHandle, tx: mpsc::Sender<Tagged>) -> Self {
+    pub(crate) fn new(handle: ConnectionHandle, tx: mpsc::Sender<Tagged>) -> Self {
         Self { handle, tx }
     }
 
@@ -117,6 +117,7 @@ pub(crate) enum Cmd {
     /// observed (or an error if the stream is reset).
     ReadToEnd {
         id: StreamId,
+        limit: usize,
         reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
     },
     /// Read up to `max` bytes, completing as soon as any data or FIN is
@@ -141,7 +142,8 @@ pub(crate) enum Cmd {
 /// or the driver's owner is dropped).
 pub struct Connection {
     remote: std::net::SocketAddr,
-    handle: quinn_proto::ConnectionHandle,
+    handle: ConnectionHandle,
+    client_id: Option<String>,
     cmds: CmdSender,
 }
 
@@ -149,13 +151,15 @@ impl Connection {
     /// Build a handle for a connection the driver owns. `cmds` is the driver's
     /// command channel, pre-tagged with this connection's handle.
     pub(crate) fn new(
-        handle: quinn_proto::ConnectionHandle,
+        handle: ConnectionHandle,
         remote: std::net::SocketAddr,
+        client_id: Option<String>,
         cmds: CmdSender,
     ) -> Self {
         Self {
             remote,
             handle,
+            client_id,
             cmds,
         }
     }
@@ -166,8 +170,17 @@ impl Connection {
     }
 
     /// The endpoint-local handle identifying this connection.
-    pub fn handle(&self) -> quinn_proto::ConnectionHandle {
+    pub fn handle(&self) -> ConnectionHandle {
         self.handle
+    }
+
+    /// Authenticated server-side client identity.
+    ///
+    /// On a connection accepted by [`crate::server::Server`], this is the
+    /// unique configured `client_id` whose PSK admitted the peer. Client-side
+    /// connections return `None`.
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
     }
 
     /// Open a new bidirectional stream.
@@ -219,6 +232,7 @@ impl std::fmt::Debug for Connection {
         f.debug_struct("Connection")
             .field("handle", &self.handle)
             .field("remote", &self.remote)
+            .field("client_id", &self.client_id)
             .finish()
     }
 }
@@ -230,18 +244,18 @@ impl std::fmt::Debug for Connection {
 /// server/client driver internals.
 ///
 /// It mirrors [`Connection`]'s stream API (which is why both are thin wrappers
-/// over the same [`Cmd`] channel) but is `Clone` and carries the raw
-/// [`quinn_proto::ConnectionHandle`], the identity h3 keys its per-connection
+/// over the same `Cmd` channel) but is `Clone` and carries the raw
+/// [`ConnectionHandle`], the identity h3 keys its per-connection
 /// state on.
 #[derive(Clone)]
 pub struct QuinnHandle {
-    handle: quinn_proto::ConnectionHandle,
+    handle: ConnectionHandle,
     cmds: CmdSender,
 }
 
 impl QuinnHandle {
     /// The endpoint-local handle identifying this connection.
-    pub fn handle(&self) -> quinn_proto::ConnectionHandle {
+    pub fn handle(&self) -> ConnectionHandle {
         self.handle
     }
 
@@ -305,12 +319,16 @@ impl Stream {
         rx.await.map_err(|_| ConnError::Closed)?
     }
 
-    /// Read the stream to end-of-stream, returning all received bytes.
-    pub async fn read_to_end(&mut self) -> Result<Vec<u8>, ConnError> {
+    /// Read the stream to end-of-stream, up to `limit` bytes.
+    ///
+    /// Returns [`ConnError::ReadLimitExceeded`] instead of allowing an
+    /// authenticated peer to grow memory without bound.
+    pub async fn read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::ReadToEnd {
                 id: self.id,
+                limit,
                 reply: tx,
             })
             .await?;
@@ -381,11 +399,7 @@ impl SendStream {
     }
 }
 
-async fn read_chunk(
-    cmds: &CmdSender,
-    id: StreamId,
-    max: usize,
-) -> Result<Vec<u8>, ConnError> {
+async fn read_chunk(cmds: &CmdSender, id: StreamId, max: usize) -> Result<Vec<u8>, ConnError> {
     if max == 0 {
         return Ok(Vec::new());
     }
@@ -417,6 +431,9 @@ struct PendingWrite {
 /// channel to fire once FIN (or a reset) is seen.
 struct PendingRead {
     buf: Vec<u8>,
+    /// `Some` for a read-to-FIN operation. We read at most one byte beyond this
+    /// bound to distinguish an exact-size stream from an oversized one.
+    end_limit: Option<usize>,
     max: Option<usize>,
     reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
 }
@@ -486,9 +503,10 @@ impl Parked {
             Cmd::Finish { id, reply } => {
                 let _ = reply.send(core.stream_finish(id));
             }
-            Cmd::ReadToEnd { id, reply } => {
+            Cmd::ReadToEnd { id, limit, reply } => {
                 let mut pending = PendingRead {
                     buf: Vec::new(),
+                    end_limit: Some(limit),
                     max: None,
                     reply,
                 };
@@ -499,6 +517,7 @@ impl Parked {
             Cmd::Read { id, max, reply } => {
                 let mut pending = PendingRead {
                     buf: Vec::new(),
+                    end_limit: None,
                     max: Some(max.max(1)),
                     reply,
                 };
@@ -623,12 +642,32 @@ impl Parked {
             let request = pending
                 .max
                 .map(|max| max.saturating_sub(filled).min(READ_CHUNK))
-                .unwrap_or(READ_CHUNK);
+                .unwrap_or_else(|| {
+                    pending
+                        .end_limit
+                        .map(|limit| {
+                            limit
+                                .saturating_add(1)
+                                .saturating_sub(filled)
+                                .min(READ_CHUNK)
+                        })
+                        .unwrap_or(READ_CHUNK)
+                })
+                .max(1);
             pending.buf.resize(filled + request, 0);
             let outcome = core.stream_read(id, &mut pending.buf[filled..]);
             match outcome {
                 Ok(ReadOutcome::Read(n)) => {
                     pending.buf.truncate(filled + n);
+                    if pending
+                        .end_limit
+                        .is_some_and(|limit| pending.buf.len() > limit)
+                    {
+                        let limit = pending.end_limit.expect("checked above");
+                        let reply = replace_reply_read(&mut pending.reply);
+                        let _ = reply.send(Err(ConnError::ReadLimitExceeded { limit }));
+                        return true;
+                    }
                     if pending.max.is_some() {
                         let buf = std::mem::take(&mut pending.buf);
                         let reply = replace_reply_read(&mut pending.reply);
@@ -650,7 +689,7 @@ impl Parked {
                     // connection carrying many short-lived streams and keeps
                     // this crate's pre-core behaviour (a second `read_to_end`
                     // on a drained stream is an error).
-                    if pending.max.is_none() {
+                    if pending.end_limit.is_some() {
                         core.forget_stream(id);
                     }
                     let buf = std::mem::take(&mut pending.buf);

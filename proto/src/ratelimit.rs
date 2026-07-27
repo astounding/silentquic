@@ -105,13 +105,20 @@ const MAX_TRACKED_SOURCES: usize = 4096;
 /// budget and starving other legitimate connecting clients.
 pub struct RateLimiter {
     global: TokenBucket,
-    per_source: HashMap<IpAddr, TokenBucket>,
-    /// LRU order, most-recently-used at the back. Kept in sync with
-    /// `per_source`'s keys.
-    lru: Vec<IpAddr>,
+    per_source: HashMap<IpAddr, SourceEntry>,
+    /// Intrusive doubly-linked LRU. Links live beside each bucket, making hits
+    /// and evictions O(1) instead of scanning a vector under source churn.
+    lru_head: Option<IpAddr>,
+    lru_tail: Option<IpAddr>,
     per_source_capacity: f64,
     per_source_refill: f64,
     max_tracked: usize,
+}
+
+struct SourceEntry {
+    bucket: TokenBucket,
+    older: Option<IpAddr>,
+    newer: Option<IpAddr>,
 }
 
 impl RateLimiter {
@@ -140,7 +147,8 @@ impl RateLimiter {
         Self {
             global: TokenBucket::new(global_capacity, global_refill),
             per_source: HashMap::new(),
-            lru: Vec::new(),
+            lru_head: None,
+            lru_tail: None,
             per_source_capacity,
             per_source_refill,
             max_tracked,
@@ -167,32 +175,80 @@ impl RateLimiter {
         if !self.global.try_take(now) {
             return false;
         }
-        self.touch_source(src, now).try_take(now)
+        self.touch_source(src).try_take(now)
     }
 
     /// Get (or create) the bucket for `src`, updating LRU order (moving `src`
     /// to most-recently-used), evicting the least-recently-used source first
     /// if the map is at capacity and `src` is new.
-    fn touch_source(&mut self, src: IpAddr, _now: Instant) -> &mut TokenBucket {
-        // Remove any existing LRU entry for `src` so the push below always
-        // (re-)inserts it at the most-recently-used end, whether `src` is
-        // already tracked or brand new.
-        if let Some(pos) = self.lru.iter().position(|ip| *ip == src) {
-            self.lru.remove(pos);
-        } else if self.per_source.len() >= self.max_tracked {
-            // `src` is new and the map is full: evict the least-recently-used
-            // tracked source (front of `lru`) to make room, bounding the
-            // map's memory regardless of how many distinct source IPs (real
-            // or spoofed) show up.
-            if !self.lru.is_empty() {
-                let evicted = self.lru.remove(0);
-                self.per_source.remove(&evicted);
+    fn touch_source(&mut self, src: IpAddr) -> &mut TokenBucket {
+        if self.per_source.contains_key(&src) {
+            self.detach(src);
+        } else {
+            if self.per_source.len() >= self.max_tracked.max(1) {
+                if let Some(oldest) = self.lru_head {
+                    self.detach(oldest);
+                    self.per_source.remove(&oldest);
+                }
             }
+            self.per_source.insert(
+                src,
+                SourceEntry {
+                    bucket: TokenBucket::new(self.per_source_capacity, self.per_source_refill),
+                    older: None,
+                    newer: None,
+                },
+            );
         }
-        self.lru.push(src);
-        self.per_source
-            .entry(src)
-            .or_insert_with(|| TokenBucket::new(self.per_source_capacity, self.per_source_refill))
+        self.attach_newest(src);
+        &mut self
+            .per_source
+            .get_mut(&src)
+            .expect("source inserted")
+            .bucket
+    }
+
+    fn detach(&mut self, src: IpAddr) {
+        let (older, newer) = {
+            let entry = self.per_source.get(&src).expect("LRU source exists");
+            (entry.older, entry.newer)
+        };
+        match older {
+            Some(ip) => {
+                self.per_source
+                    .get_mut(&ip)
+                    .expect("older link exists")
+                    .newer = newer
+            }
+            None => self.lru_head = newer,
+        }
+        match newer {
+            Some(ip) => {
+                self.per_source
+                    .get_mut(&ip)
+                    .expect("newer link exists")
+                    .older = older
+            }
+            None => self.lru_tail = older,
+        }
+        let entry = self.per_source.get_mut(&src).expect("LRU source exists");
+        entry.older = None;
+        entry.newer = None;
+    }
+
+    fn attach_newest(&mut self, src: IpAddr) {
+        let old_tail = self.lru_tail;
+        {
+            let entry = self.per_source.get_mut(&src).expect("LRU source exists");
+            entry.older = old_tail;
+            entry.newer = None;
+        }
+        if let Some(tail) = old_tail {
+            self.per_source.get_mut(&tail).expect("tail exists").newer = Some(src);
+        } else {
+            self.lru_head = Some(src);
+        }
+        self.lru_tail = Some(src);
     }
 }
 
@@ -236,7 +292,10 @@ mod tests {
         let mut rl = RateLimiter::with_params(1000.0, 1000.0, 2.0, 1.0, 16);
         assert!(rl.check(ip(1), t0));
         assert!(rl.check(ip(1), t0));
-        assert!(!rl.check(ip(1), t0), "third packet from same source in same instant must be blocked");
+        assert!(
+            !rl.check(ip(1), t0),
+            "third packet from same source in same instant must be blocked"
+        );
     }
 
     #[test]
@@ -286,6 +345,21 @@ mod tests {
         );
         assert!(rl.per_source.contains_key(&ip(2)));
         assert!(rl.per_source.contains_key(&ip(3)));
+    }
+
+    #[test]
+    fn a_hit_moves_source_to_newest_in_constant_time_lru() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::with_params(1_000_000.0, 1_000_000.0, 5.0, 5.0, 2);
+        assert!(rl.check(ip(1), t0));
+        assert!(rl.check(ip(2), t0));
+        assert!(rl.check(ip(1), t0), "touch ip(1), making ip(2) oldest");
+        assert!(rl.check(ip(3), t0));
+        assert!(rl.per_source.contains_key(&ip(1)));
+        assert!(!rl.per_source.contains_key(&ip(2)));
+        assert!(rl.per_source.contains_key(&ip(3)));
+        assert_eq!(rl.lru_head, Some(ip(1)));
+        assert_eq!(rl.lru_tail, Some(ip(3)));
     }
 
     #[test]

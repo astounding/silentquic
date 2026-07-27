@@ -350,7 +350,11 @@ fn read_after_draining_available_data_reports_blocked_until_fin() {
     pair.drive();
 
     let accepted = pair.server().accept_bi().expect("accept_bi");
-    assert_eq!(accepted, Some(id), "server sees the stream the client opened");
+    assert_eq!(
+        accepted,
+        Some(id),
+        "server sees the stream the client opened"
+    );
 
     let mut buf = [0u8; 64];
     assert_eq!(
@@ -419,7 +423,10 @@ fn a_short_buffer_reads_incrementally_without_losing_bytes() {
             ReadOutcome::Finished => break,
         }
     }
-    assert_eq!(got, b"abcdefgh", "every byte survived the incremental reads");
+    assert_eq!(
+        got, b"abcdefgh",
+        "every byte survived the incremental reads"
+    );
 }
 
 /// `accept_bi` is non-blocking: with no peer-opened stream pending it answers
@@ -442,7 +449,10 @@ fn accept_bi_with_nothing_pending_returns_none() {
 #[test]
 fn locally_closed_connection_reaches_is_drained_without_a_lost_event() {
     let mut pair = connected_pair();
-    assert!(!pair.client.is_drained(), "a live connection is not drained");
+    assert!(
+        !pair.client.is_drained(),
+        "a live connection is not drained"
+    );
 
     let now = Instant::now();
     pair.client

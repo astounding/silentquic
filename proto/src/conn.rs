@@ -54,6 +54,9 @@ pub enum ConnError {
     /// otherwise refused by the transport.
     #[error("stream error: {0}")]
     Stream(String),
+    /// A bounded convenience read received more bytes than its caller allowed.
+    #[error("stream exceeded read limit of {limit} bytes")]
+    ReadLimitExceeded { limit: usize },
 }
 
 /// What one [`ConnState::service_streams`] pass observed.

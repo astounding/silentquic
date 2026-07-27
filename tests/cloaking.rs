@@ -155,7 +155,9 @@ async fn junk_scan_is_silent() {
     for i in 0..100usize {
         let len = 1 + (i * 37) % 1400; // spread lengths across [1, 1400]
         let junk = random_bytes(len);
-        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind junk sender");
+        let sender = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind junk sender");
         sender
             .send_to(&junk, server_addr)
             .await
@@ -190,7 +192,9 @@ async fn junk_scan_is_silent() {
     assert!(
         reply.is_err(),
         "server emitted bytes to a junk sender (silence violated): {:?}",
-        reply.map(|r| r.map(|j| j.map(|(i, n, from)| format!("{n} bytes to sender #{i} from {from}"))))
+        reply
+            .map(|r| r
+                .map(|j| j.map(|(i, n, from)| format!("{n} bytes to sender #{i} from {from}"))))
     );
 }
 
@@ -255,7 +259,9 @@ async fn replay_is_silent() {
     // crypto — see the core's `Endpoint::handle_datagram` ordering.) We don't assert silence
     // here; the point of this send is purely to populate the replay guard, as
     // the brief's fallback approach describes.
-    let first_sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind first sender");
+    let first_sender = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind first sender");
     first_sender
         .send_to(&initial, server_addr)
         .await
@@ -267,7 +273,9 @@ async fn replay_is_silent() {
     // socket (different source address), proving the replay guard keys on
     // (nonce, freshness) and not on the sender. This must be silently
     // dropped: same nonce + same freshness has already been recorded.
-    let replay_sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind replay sender");
+    let replay_sender = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind replay sender");
     replay_sender
         .send_to(&initial, server_addr)
         .await
@@ -400,14 +408,17 @@ async fn happy_path_connects_and_echoes() {
             .await
             .expect("server should accept a bidirectional stream");
         let got = stream
-            .read_to_end()
+            .read_to_end(1024)
             .await
             .expect("server should read the stream to end");
         stream
             .write_all(&got)
             .await
             .expect("server should write the echo");
-        stream.finish().await.expect("server should finish the echo");
+        stream
+            .finish()
+            .await
+            .expect("server should finish the echo");
         got
     });
 
@@ -420,22 +431,41 @@ async fn happy_path_connects_and_echoes() {
         .await
         .expect("client connect should not time out")
         .expect("authorized client should complete the handshake");
-    assert_eq!(conn.remote_address(), addr, "client is connected to the real server");
+    assert_eq!(
+        conn.remote_address(),
+        addr,
+        "client is connected to the real server"
+    );
 
     const PAYLOAD: &[u8] = b"silentquic-cloaking-suite-happy-path";
-    let mut stream = conn.open_stream().await.expect("client should open a stream");
-    stream.write_all(PAYLOAD).await.expect("client should write the payload");
-    stream.finish().await.expect("client should finish its send");
+    let mut stream = conn
+        .open_stream()
+        .await
+        .expect("client should open a stream");
+    stream
+        .write_all(PAYLOAD)
+        .await
+        .expect("client should write the payload");
+    stream
+        .finish()
+        .await
+        .expect("client should finish its send");
 
-    let echo = timeout(HAPPY_TIMEOUT, stream.read_to_end())
+    let echo = timeout(HAPPY_TIMEOUT, stream.read_to_end(1024))
         .await
         .expect("client read should not time out")
         .expect("client should read the echo");
-    assert_eq!(&echo, PAYLOAD, "client must receive the echoed payload unchanged");
+    assert_eq!(
+        &echo, PAYLOAD,
+        "client must receive the echoed payload unchanged"
+    );
 
     let server_got = timeout(HAPPY_TIMEOUT, server_task)
         .await
         .expect("server task should not time out")
         .expect("server task should not panic");
-    assert_eq!(&server_got, PAYLOAD, "server must have received the exact payload");
+    assert_eq!(
+        &server_got, PAYLOAD,
+        "server must have received the exact payload"
+    );
 }

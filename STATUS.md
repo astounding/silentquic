@@ -13,13 +13,16 @@ Known limitations and the threat boundary are documented in [README.md](README.m
 
 - Add standard `AsyncRead`/`AsyncWrite` trait implementations around the
   incremental split stream handles.
-- Make `read_to_end` require a size limit and implement it over incremental
-  reads.
-- Delete the Tokio layer's bespoke `read_to_end` accumulator once the bounded
-  convenience is implemented over incremental reads.
 - Consider configurable reject-path rate limits and improved early-flight loss
   recovery without weakening replay silence.
 - Consider a C FFI over `silentquic-proto`.
+
+## Release status
+
+The next release is `0.1.0-alpha.1`. It is an experimental preview, not a
+production-hardening claim. Public connection handles are generation-safe,
+accepted server connections expose their PSK-derived `client_id`, and
+`read_to_end` requires an explicit memory bound.
 
 The Ruby binding, backup application, and `squicusock` relay are maintained as
 independent projects.

@@ -64,12 +64,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("keys.toml");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(br#"
+        f.write_all(
+            br#"
 listen = "127.0.0.1:4443"
 [[clients]]
 client_id = "a"
 psk = "0000000000000000000000000000000000000000000000000000000000000002"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let secrets = FileSource::new(&path).load().unwrap();
         assert_eq!(secrets.clients[0].psk.as_bytes()[31], 2);
     }

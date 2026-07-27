@@ -378,14 +378,10 @@ impl Harness {
     /// Deliver one datagram to the client endpoint.
     fn deliver_to_client(&mut self, now: Instant, from: SocketAddr, data: &[u8]) {
         let mut resp = Vec::new();
-        if let Some(DatagramEvent::ConnectionEvent(ch, cev)) = self.client_ep.handle(
-            now,
-            from,
-            None,
-            None,
-            BytesMut::from(data),
-            &mut resp,
-        ) {
+        if let Some(DatagramEvent::ConnectionEvent(ch, cev)) =
+            self.client_ep
+                .handle(now, from, None, None, BytesMut::from(data), &mut resp)
+        {
             if ch == self.client_ch {
                 self.client_conn.handle_event(cev);
             }
@@ -455,11 +451,7 @@ fn run<G: Fn(&[u8]) -> bool>(
 
         h.poll_states();
 
-        if do_stream_echo
-            && h.client_connected
-            && h.server_connected
-            && !stream_done
-        {
+        if do_stream_echo && h.client_connected && h.server_connected && !stream_done {
             stream_done = echo.step(&mut h);
         }
 

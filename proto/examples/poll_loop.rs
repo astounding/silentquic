@@ -49,11 +49,11 @@ use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Instant;
 
-use quinn_proto::{ConnectionHandle, StreamId};
+use quinn_proto::StreamId;
 use silentquic_proto::config::{ClientConfigFile, ServerSecrets};
 use silentquic_proto::endpoint::Endpoint;
 use silentquic_proto::freshness::now_minutes;
-use silentquic_proto::outcome::{Event, ReadOutcome};
+use silentquic_proto::outcome::{ConnectionHandle, Event, ReadOutcome};
 
 /// A 64-hex-character pre-shared key, shared by both ends.
 const PSK_HEX: &str = "00000000000000000000000000000000000000000000000000000000000000bb";
@@ -135,8 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
     // The caller owns the clock: the core reads neither the monotonic nor the
     // wall clock, so both `now` and the coarse freshness minute are passed in.
-    let (client_endpoint, client_conn) =
-        Endpoint::new_client(Instant::now(), now_minutes(), cfg)?;
+    let (client_endpoint, client_conn) = Endpoint::new_client(Instant::now(), now_minutes(), cfg)?;
     let mut client = Peer {
         name: "client",
         endpoint: client_endpoint,
@@ -217,7 +216,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 String::from_utf8_lossy(&received)
             );
             assert_eq!(received, PAYLOAD, "payload must round-trip intact");
-            assert!(client_stream.is_some(), "client should have opened a stream");
+            assert!(
+                client_stream.is_some(),
+                "client should have opened a stream"
+            );
             println!("poll_loop: OK — no runtime, no threads, nothing blocked");
             return Ok(());
         }

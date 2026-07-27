@@ -17,6 +17,10 @@ logic; it exposes raw authenticated bidirectional byte streams for a caller
 (e.g. a backup tool, a config-push agent, anything that wants a QUIC pipe that
 doesn't advertise itself to the internet) to frame however it likes.
 
+> **Release status:** `0.1.0-alpha.1` is an experimental preview. The protocol
+> has extensive automated tests but has not yet received an independent
+> cryptographic review. Do not treat it as production-hardened.
+
 ## Architecture: two crates, pick your I/O model
 
 | Crate | What it is | Use it when |
@@ -43,6 +47,8 @@ rather than of the caller's control flow.
 
 Full design rationale lives in
 [`docs/specs/2026-07-03-silentquic-design.md`](docs/specs/2026-07-03-silentquic-design.md).
+See the [`docs` map](docs/README.md) for the distinction between current
+normative documentation and archived implementation plans.
 This README's Threat Model section below reproduces the spec's threat model
 verbatim in substance — read it before deploying.
 
@@ -63,7 +69,9 @@ openssl rand -hex 32
 ### 2. Server config (`server.toml`)
 
 The server holds the listen address and the full set of authorized clients
-(`client_id -> psk`). `chmod 600` it — it's cleartext secret material on disk.
+(`client_id -> psk`). IDs and PSKs must both be unique. The server derives the
+authenticated `client_id` from the PSK that admitted the connection. `chmod
+600` the file — it is cleartext secret material on disk.
 
 ```toml
 listen = "0.0.0.0:443"
@@ -79,7 +87,9 @@ psk = "7e02dd...<64 hex chars>...11"
 
 ### 3. Client config (`client.toml`)
 
-Each client holds its own identity, its PSK, and the server it dials.
+Each client holds a local descriptive label, its PSK, and the server it dials.
+The client-side `client_id` is not sent on the wire; the server identifies the
+peer from its unique configured PSK entry.
 
 ```toml
 client_id = "backup-host-1"
@@ -104,8 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Only ever fires for a peer that proved PSK possession and
             // completed the QUIC handshake — unauthorized peers never reach
             // this point at all.
+            println!("authenticated client: {:?}", conn.client_id());
             let mut stream = conn.accept_stream().await.expect("accept stream");
-            let msg = stream.read_to_end().await.expect("read");
+            let msg = stream.read_to_end(1024 * 1024).await.expect("read");
             println!("got {} bytes from {}", msg.len(), conn.remote_address());
         });
     }
@@ -132,10 +143,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-That's the whole surface for v1: `Server::bind` / `Server::accept`,
-`Client::connect`, and `Connection::open_stream` / `accept_stream` /
-`Stream::write_all` / `finish` / `read_to_end`. Framing on top of these raw
-byte streams is left to the caller.
+The primary surface is `Server::bind` / `Server::accept`, `Client::connect`,
+`Connection::open_stream` / `accept_stream` / `close`, and the stream methods
+`read(max)` / `write_all` / `finish` / `read_to_end(limit)` / `split`.
+`Connection::client_id` identifies an accepted peer on the server. Framing on
+top of these raw byte streams is left to the caller.
+
+For full-duplex or untrusted-size traffic, split the stream and read
+incrementally:
+
+```rust,no_run
+# async fn relay(stream: silentquic::conn::Stream) -> Result<(), silentquic::conn::ConnError> {
+let (mut recv, mut send) = stream.split();
+let reader = async move {
+    loop {
+        let chunk = recv.read(16 * 1024).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        println!("received {} bytes", chunk.len());
+    }
+    Ok::<_, silentquic::conn::ConnError>(())
+};
+let writer = async move {
+    send.write_all(b"request").await?;
+    send.finish().await
+};
+tokio::try_join!(reader, writer)?;
+# Ok(())
+# }
+```
 
 The underlying `quinn_proto::Connection` is reachable via
 `Connection::quinn_connection()`, which returns a `QuinnHandle` exposing
@@ -205,11 +242,10 @@ discovering them under load.
    handful of concurrent clients (the expected backup-transport use case), but
    not tuned for high fan-out (hundreds+ of simultaneous connections on one
    server).
-2. **`Stream::read_to_end` buffers the entire stream in memory, unbounded.**
-   A post-authentication peer that sends an unbounded amount of data can exhaust
-   memory if a caller uses this convenience. Interactive or untrusted-size
-   applications must use bounded `Stream::read(max)` or split the stream into
-   its independent receive/send handles and read incrementally.
+2. **`Stream::read_to_end(limit)` buffers up to the caller's explicit limit.**
+   It returns `ConnError::ReadLimitExceeded` if the peer sends more. Interactive
+   applications should still use `Stream::read(max)` or split the stream into
+   independent receive/send handles and process data incrementally.
 3. **Rate-limit parameters are compile-time constants**, not yet configurable
    via TOML. The per-source and global buckets that bound the unauthenticated
    pre-filter's CPU cost (see Threat Model, resource side-channel) cannot

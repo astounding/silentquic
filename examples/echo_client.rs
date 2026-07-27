@@ -28,7 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: echo_client <server_addr> <psk_hex> [message] [client_id] [bind_addr]")?;
     let psk = args.next().ok_or("missing <psk_hex> (64 hex chars)")?;
-    let message = args.next().unwrap_or_else(|| "hello from silentquic".to_string());
+    let message = args
+        .next()
+        .unwrap_or_else(|| "hello from silentquic".to_string());
     let client_id = args.next().unwrap_or_else(|| "peer".to_string());
     // Optional: pin the local source address/port. Omitted ⇒ ephemeral on any
     // interface, which is the default and the right choice unless a firewall or
@@ -60,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.finish().await?;
     println!("sent {} bytes", message.len());
 
-    let echo = stream.read_to_end().await?;
+    let echo = stream.read_to_end(1024 * 1024).await?;
     println!("echo: {:?}", String::from_utf8_lossy(&echo));
 
     if echo == message.as_bytes() {

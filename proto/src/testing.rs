@@ -35,13 +35,13 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use quinn_proto::{ConnectionHandle, Side, StreamId};
+use quinn_proto::{Side, StreamId};
 
 use crate::config::{ClientConfigFile, ServerSecrets};
 use crate::conn::ConnState;
 use crate::endpoint::Endpoint;
 use crate::freshness::now_minutes;
-use crate::outcome::{DatagramOutcome, Event, ReadOutcome, WriteOutcome};
+use crate::outcome::{ConnectionHandle, DatagramOutcome, Event, ReadOutcome, WriteOutcome};
 
 /// The PSK both sides of a [`Pair`] share. A fixed test value; it never leaves
 /// this process.
@@ -167,7 +167,8 @@ impl Pair {
     /// The server's connection handle. Panics before the server has admitted the
     /// client.
     pub fn server_ch(&self) -> ConnectionHandle {
-        self.server_ch.expect("the server has admitted a connection")
+        self.server_ch
+            .expect("the server has admitted a connection")
     }
 
     /// The named side's connection state. Panics if it has been reaped.

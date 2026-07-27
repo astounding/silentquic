@@ -53,7 +53,7 @@ pub enum DatagramOutcome {
     /// `poll_transmit`; this enum answers "did it give me a connection?".
     Dropped,
     /// The datagram was admitted and routed to this connection.
-    Accepted(quinn_proto::ConnectionHandle),
+    Accepted(ConnectionHandle),
 }
 
 /// Result of a non-blocking stream read.
@@ -82,41 +82,50 @@ pub enum WriteOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// A connection completed its handshake and is ready for streams.
-    Connected(quinn_proto::ConnectionHandle),
+    Connected(ConnectionHandle),
     /// The peer opened a stream.
     StreamOpened {
-        conn: quinn_proto::ConnectionHandle,
+        conn: ConnectionHandle,
         id: quinn_proto::StreamId,
     },
     /// A stream has data buffered; a previously `Blocked` read may now progress.
     StreamReadable {
-        conn: quinn_proto::ConnectionHandle,
+        conn: ConnectionHandle,
         id: quinn_proto::StreamId,
     },
     /// Flow control opened; a previously `Blocked` write may now progress.
     StreamWritable {
-        conn: quinn_proto::ConnectionHandle,
+        conn: ConnectionHandle,
         id: quinn_proto::StreamId,
     },
     /// The connection is gone.
     ///
-    /// # ⚠ `conn` is invalid from this moment on, and may be REUSED
     ///
-    /// `ConnectionHandle` is quinn-proto's slab index, and quinn-proto hands a
-    /// freed index straight back out to the next connection it accepts. So a
-    /// retained handle does not merely go stale — it can start naming a
-    /// *different, live* connection, and
-    /// [`crate::endpoint::Endpoint::conn_mut`] will return `Some` for it with no
-    /// error of any kind.
-    ///
-    /// Callers that retain handles MUST therefore drain
-    /// [`crate::endpoint::Endpoint::poll_event`] and drop every handle named by
-    /// a `ConnectionLost` **before** using any retained handle again. Treat this
-    /// event as the handle's destructor.
-    ///
-    /// (The structural fix is a generation counter on the handle; it is a
-    /// deliberate follow-up, not implemented here.)
-    ConnectionLost {
-        conn: quinn_proto::ConnectionHandle,
-    },
+    /// The handle becomes permanently stale at this point. Generation checking
+    /// guarantees that retaining it cannot address a later connection even if
+    /// Quinn reuses its internal slab slot.
+    ConnectionLost { conn: ConnectionHandle },
+}
+/// A generation-safe identifier for a connection owned by an [`Endpoint`].
+///
+/// Quinn's internal handle is a reusable slab index. This wrapper pairs that
+/// index with a monotonically increasing generation assigned by silentquic, so
+/// a handle retained after `ConnectionLost` can never name a later connection.
+///
+/// [`Endpoint`]: crate::endpoint::Endpoint
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionHandle {
+    pub(crate) quinn: quinn_proto::ConnectionHandle,
+    pub(crate) generation: u64,
+}
+
+impl ConnectionHandle {
+    pub(crate) fn new(quinn: quinn_proto::ConnectionHandle, generation: u64) -> Self {
+        Self { quinn, generation }
+    }
+
+    /// A process-local monotonically increasing generation, useful for logging.
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
 }

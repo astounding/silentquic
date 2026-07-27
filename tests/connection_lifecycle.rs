@@ -86,7 +86,7 @@ async fn server_side_close_is_reaped_across_many_cycles() {
             .await
             .unwrap_or_else(|_| panic!("accept_stream hung on cycle {cycle}"))
             .expect("server accept_stream");
-        let got = timeout(STEP, server_stream.read_to_end())
+        let got = timeout(STEP, server_stream.read_to_end(1024))
             .await
             .unwrap_or_else(|_| panic!("read_to_end hung on cycle {cycle}"))
             .expect("server read_to_end");

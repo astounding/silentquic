@@ -67,11 +67,10 @@ Several implementation bugs established durable invariants:
 The original Tokio API exposed only unbounded `read_to_end`, which both risks
 memory exhaustion and forced bespoke parked-read state. Incremental bounded
 `read(max)` and split receive/send handles were added when `squicusock` needed
-interactive full-duplex forwarding. The remaining direction is to implement
-standard async read/write traits and offer `read_to_end(limit)` only as a
-bounded convenience. The old accumulator should then be deleted rather than
-maintained as a second path. The sans-I/O core already has the correct
-incremental model.
+interactive full-duplex forwarding. The Tokio wrapper now offers
+`read_to_end(limit)` as a bounded convenience over the incremental core path.
+The remaining direction is to implement standard async read/write traits. The
+sans-I/O core already has the correct incremental model.
 
 ## Validation record
 

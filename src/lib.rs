@@ -11,15 +11,14 @@
 //! `Initial` decryption on every flow, or a resource side-channel via a
 //! co-located service. **Run it as the only service on its host.** See
 //! `README.md`'s `Limitations` section for boundaries not yet
-//! production-hardened (single-threaded driver, unbounded
-//! `Stream::read_to_end`, compile-time rate limits, CID pruning only at
+//! production-hardened (single-threaded driver, compile-time rate limits, CID pruning only at
 //! connection close).
 
 // Protocol logic lives in the sans-IO core crate; re-exported here so
 // `silentquic::selector::…` (and friends) keep resolving unchanged.
 pub use silentquic_proto::{freshness, initial_keys, ratelimit, replay, selector, transport};
 
+pub mod client;
 pub mod config;
 pub mod conn;
 pub mod server;
-pub mod client;

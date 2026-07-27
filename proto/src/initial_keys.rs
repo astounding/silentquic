@@ -38,8 +38,8 @@ use aws_lc_rs::{aead, hkdf};
 use bytes::BytesMut;
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::crypto::{
-    self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, ServerConfig,
-    Session, UnsupportedVersion,
+    self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey,
+    ServerConfig, Session, UnsupportedVersion,
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError};
@@ -173,8 +173,8 @@ struct InitialPacketKey {
 
 impl InitialPacketKey {
     fn new(key: &[u8; AEAD_KEY_LEN], iv: [u8; IV_LEN]) -> Self {
-        let unbound = aead::UnboundKey::new(&aead::AES_128_GCM, key)
-            .expect("AES-128-GCM key is 16 bytes");
+        let unbound =
+            aead::UnboundKey::new(&aead::AES_128_GCM, key).expect("AES-128-GCM key is 16 bytes");
         Self {
             key: aead::LessSafeKey::new(unbound),
             iv,
@@ -341,7 +341,12 @@ impl ServerConfig for PskServerConfig {
         if version != QUIC_V1 {
             return Err(UnsupportedVersion);
         }
-        Ok(initial_keys_from_psk(&self.psk, dst_cid, Side::Server, version))
+        Ok(initial_keys_from_psk(
+            &self.psk,
+            dst_cid,
+            Side::Server,
+            version,
+        ))
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
@@ -491,14 +496,20 @@ mod tests {
         buf.extend_from_slice(HEADER);
         buf.extend_from_slice(PLAINTEXT);
         buf.extend_from_slice(&[0u8; TAG_LEN]);
-        keys.packet.local.encrypt(packet_number, &mut buf, HEADER.len());
+        keys.packet
+            .local
+            .encrypt(packet_number, &mut buf, HEADER.len());
 
         // The ciphertext-plus-tag (everything after the header) is the pinned
         // observable. Header bytes are AAD and pass through unchanged.
-        assert_eq!(&buf[..HEADER.len()], HEADER, "header is AAD, must be unchanged");
+        assert_eq!(
+            &buf[..HEADER.len()],
+            HEADER,
+            "header is AAD, must be unchanged"
+        );
         const EXPECTED_CIPHERTEXT_AND_TAG: [u8; 30] = [
-            198, 61, 185, 123, 150, 238, 166, 92, 206, 201, 222, 182, 234, 1, 23,
-            173, 206, 213, 38, 157, 83, 65, 52, 141, 167, 192, 156, 193, 3, 183,
+            198, 61, 185, 123, 150, 238, 166, 92, 206, 201, 222, 182, 234, 1, 23, 173, 206, 213,
+            38, 157, 83, 65, 52, 141, 167, 192, 156, 193, 3, 183,
         ];
         assert_eq!(&buf[HEADER.len()..], &EXPECTED_CIPHERTEXT_AND_TAG);
     }

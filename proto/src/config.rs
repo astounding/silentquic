@@ -90,6 +90,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("parse: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
 }
 
 #[cfg(test)]
@@ -125,5 +127,13 @@ client_id = "a"
 psk = "xyz"
 "#;
         assert!(toml::from_str::<ServerSecrets>(toml).is_err());
+    }
+
+    #[test]
+    fn config_error_can_report_semantic_validation() {
+        assert_eq!(
+            ConfigError::Invalid("duplicate client_id".into()).to_string(),
+            "invalid configuration: duplicate client_id"
+        );
     }
 }

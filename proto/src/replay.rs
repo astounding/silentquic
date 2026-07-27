@@ -10,7 +10,10 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     pub fn new(window_minutes: u32) -> Self {
-        Self { window: window_minutes, seen: HashSet::new() }
+        Self {
+            window: window_minutes,
+            seen: HashSet::new(),
+        }
     }
 
     pub fn len(&self) -> usize {

@@ -8,13 +8,13 @@
 //! certificate verification skipped (the PSK authenticates, not the cert), and
 //! the per-connection state machine. What is left here is the part that needs a
 //! runtime: a UDP socket, a timer, and the channels behind the public
-//! [`Connection`] / [`Stream`] handles.
+//! [`Connection`] / [`crate::conn::Stream`] handles.
 //!
 //! # The pump
 //!
-//! [`ClientDriver::run`] is one `select!` over three wakeups — an inbound
+//! `ClientDriver::run` is one `select!` over three wakeups — an inbound
 //! datagram, a handle command, and the connection timer — and each one is a
-//! single call into the core. Between wakeups, [`ClientDriver::pump`] drains the
+//! single call into the core. Between wakeups, `ClientDriver::pump` drains the
 //! core in the order [`silentquic_proto::endpoint`] documents, **which is
 //! load-bearing**:
 //!
@@ -51,9 +51,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use quinn_proto::ConnectionHandle;
 use silentquic_proto::endpoint::Endpoint as Core;
 use silentquic_proto::freshness::now_minutes;
+use silentquic_proto::outcome::ConnectionHandle;
 use silentquic_proto::outcome::Event as CoreEvent;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -101,7 +101,7 @@ pub enum ClientError {
     #[error("handshake ended without connecting")]
     HandshakeIncomplete,
     /// The handshake did not reach `Connected` within the connect timeout (see
-    /// [`DEFAULT_CONNECT_TIMEOUT`]). Distinct from `ConnectionLost`: this fires
+    /// the default connect timeout). Distinct from `ConnectionLost`: this fires
     /// when the peer never responds at all, rather than when it actively tears
     /// the handshake down.
     #[error("connect timed out")]
@@ -118,6 +118,9 @@ fn client_error(err: ConfigError) -> ClientError {
     match err {
         ConfigError::Io(io) => ClientError::Io(io),
         ConfigError::Parse(parse) => ClientError::Io(io::Error::other(parse.to_string())),
+        ConfigError::Invalid(message) => {
+            ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, message))
+        }
     }
 }
 
@@ -141,7 +144,7 @@ impl Client {
     /// `Connected`; the background driver keeps pumping so post-handshake stream
     /// I/O flows.
     ///
-    /// Bounded internally by [`DEFAULT_CONNECT_TIMEOUT`]: this does not rely
+    /// Bounded internally by the default connect timeout: this does not rely
     /// solely on `quinn_proto`'s idle timer, so a caller who omits their own
     /// timeout still cannot hang forever against a server that never responds.
     pub async fn connect(cfg: ClientConfigFile) -> Result<Connection, ClientError> {
@@ -150,14 +153,14 @@ impl Client {
 }
 
 /// Free-function form of [`Client::connect`], per the task interface. Bounded by
-/// [`DEFAULT_CONNECT_TIMEOUT`]; see [`connect_with_timeout`] for the injectable
+/// the default connect timeout; an injectable timeout is used internally for the
 /// version used by tests.
 pub async fn connect(cfg: ClientConfigFile) -> Result<Connection, ClientError> {
     connect_with_timeout(cfg, DEFAULT_CONNECT_TIMEOUT).await
 }
 
 /// Dial the server and drive the handshake to completion, bounded by
-/// `connect_timeout`. `connect` delegates here with [`DEFAULT_CONNECT_TIMEOUT`];
+/// `connect_timeout`. `connect` delegates here with the default connect timeout;
 /// kept private with an overridable duration so tests can force the timeout
 /// path quickly without waiting out the production default.
 async fn connect_with_timeout(
@@ -417,7 +420,7 @@ impl ClientDriver {
         };
         let remote = state.conn().remote_address();
         let cmds = CmdSender::new(self.handle, self.cmd_tx.clone());
-        let _ = tx.send(Ok(Connection::new(self.handle, remote, cmds)));
+        let _ = tx.send(Ok(Connection::new(self.handle, remote, None, cmds)));
     }
 
     /// Route one handle-issued command to the connection.

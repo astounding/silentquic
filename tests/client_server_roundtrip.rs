@@ -19,6 +19,7 @@
 
 use silentquic::client::Client;
 use silentquic::config::{ClientConfigFile, ServerSecrets};
+use silentquic::conn::ConnError;
 use silentquic::server::Server;
 
 #[tokio::test]
@@ -37,8 +38,11 @@ async fn authorized_client_completes_handshake_over_udp() {
     // driver only surfaces once the QUIC handshake for an admitted peer reaches
     // `Connected` (positive-admission path end-to-end).
     let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.expect("server should accept an authorized peer");
-        conn.remote_address()
+        let conn = server
+            .accept()
+            .await
+            .expect("server should accept an authorized peer");
+        (conn.remote_address(), conn.client_id().map(str::to_owned))
     });
 
     let cfg: ClientConfigFile = toml::from_str(&format!(
@@ -53,19 +57,23 @@ async fn authorized_client_completes_handshake_over_udp() {
         .expect("client connect should not time out")
         .expect("client should complete the handshake");
 
-    assert_eq!(conn.remote_address(), addr, "client is connected to the server");
-
-    let server_remote = tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
-        .await
-        .expect("server accept should not time out")
-        .expect("server task should not panic");
-
-    // Sanity: the server saw the client's real source address.
     assert_eq!(
-        server_remote.ip(),
-        std::net::Ipv4Addr::LOCALHOST,
-        "server accepted a loopback peer"
+        conn.remote_address(),
+        addr,
+        "client is connected to the server"
     );
+
+    let (server_remote, client_id) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
+            .await
+            .expect("server accept should not time out")
+            .expect("server task should not panic");
+    assert_eq!(client_id.as_deref(), Some("a"));
+
+    // Sanity: the server saw a concrete IPv4 source address. A FreeBSD VNET
+    // jail may route a dial to 127.0.0.1 from the jail's primary address, so
+    // requiring the observed peer itself to be loopback is not portable.
+    assert!(server_remote.is_ipv4(), "server accepted an IPv4 peer");
 }
 
 /// The end-to-end data-flow proof: a real stream echo over real UDP through the
@@ -97,7 +105,7 @@ async fn stream_echo_roundtrips_over_udp() {
             .await
             .expect("server should accept a bidirectional stream");
         let got = stream
-            .read_to_end()
+            .read_to_end(1024)
             .await
             .expect("server should read the stream to end");
         // Echo back what we received.
@@ -105,7 +113,10 @@ async fn stream_echo_roundtrips_over_udp() {
             .write_all(&got)
             .await
             .expect("server should write the echo");
-        stream.finish().await.expect("server should finish the echo");
+        stream
+            .finish()
+            .await
+            .expect("server should finish the echo");
         got
     });
 
@@ -124,14 +135,20 @@ async fn stream_echo_roundtrips_over_udp() {
     let _quinn = conn.quinn_connection();
 
     // Client: open a stream, write "ping", finish, then read the echo back.
-    let mut stream = conn.open_stream().await.expect("client should open a stream");
+    let mut stream = conn
+        .open_stream()
+        .await
+        .expect("client should open a stream");
     stream
         .write_all(b"ping")
         .await
         .expect("client should write ping");
-    stream.finish().await.expect("client should finish its send");
+    stream
+        .finish()
+        .await
+        .expect("client should finish its send");
 
-    let echo = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end())
+    let echo = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(1024))
         .await
         .expect("client read should not time out")
         .expect("client should read the echo");
@@ -142,6 +159,38 @@ async fn stream_echo_roundtrips_over_udp() {
         .expect("server task should not time out")
         .expect("server task should not panic");
     assert_eq!(&server_got, b"ping", "server must have received the ping");
+}
+
+#[tokio::test]
+async fn bounded_read_rejects_oversized_stream() {
+    let psk_hex = "0000000000000000000000000000000000000000000000000000000000000016";
+    let secrets: ServerSecrets = toml::from_str(&format!(
+        "listen=\"127.0.0.1:0\"\n[[clients]]\nclient_id=\"bounded\"\npsk=\"{psk_hex}\"\n"
+    ))
+    .unwrap();
+    let mut server = Server::bind(secrets).await.unwrap();
+    let addr = server.local_addr();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        let mut stream = conn.accept_stream().await.expect("accept stream");
+        stream.write_all(b"12345").await.expect("write");
+        stream.finish().await.expect("finish");
+    });
+
+    let cfg: ClientConfigFile = toml::from_str(&format!(
+        "client_id=\"local-label\"\npsk=\"{psk_hex}\"\nserver=\"{addr}\"\n"
+    ))
+    .unwrap();
+    let conn = Client::connect(cfg).await.expect("connect");
+    let mut stream = conn.open_stream().await.expect("open");
+    stream.finish().await.expect("finish request");
+    let err = stream
+        .read_to_end(4)
+        .await
+        .expect_err("five bytes must exceed a four-byte limit");
+    assert!(matches!(err, ConnError::ReadLimitExceeded { limit: 4 }));
+    server_task.await.expect("server task");
 }
 
 #[tokio::test]
@@ -244,7 +293,9 @@ async fn mismatched_bind_family_is_rejected() {
     ))
     .unwrap();
 
-    let err = Client::connect(cfg).await.expect_err("must reject v6 bind for a v4 server");
+    let err = Client::connect(cfg)
+        .await
+        .expect_err("must reject v6 bind for a v4 server");
     let msg = err.to_string();
     assert!(
         msg.contains("different IP versions"),

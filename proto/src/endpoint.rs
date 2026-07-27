@@ -72,8 +72,8 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use quinn_proto::{
-    ClientConfig as TransportClientConfig, ConnectionHandle, ConnectionId, DatagramEvent,
-    EndpointConfig, ServerConfig as TransportServerConfig,
+    ClientConfig as TransportClientConfig, ConnectionHandle as QuinnConnectionHandle, ConnectionId,
+    DatagramEvent, EndpointConfig, ServerConfig as TransportServerConfig,
 };
 
 use crate::config::{ClientConfigFile, ConfigError, Psk, ServerSecrets};
@@ -83,7 +83,7 @@ use crate::crypto::{
 };
 use crate::freshness::{is_fresh, now_minutes, WINDOW_MINUTES};
 use crate::initial_keys::{PskClientConfig, PskServerConfig};
-use crate::outcome::{DatagramOutcome, Event, Transmit};
+use crate::outcome::{ConnectionHandle, DatagramOutcome, Event, Transmit};
 use crate::ratelimit::RateLimiter;
 use crate::replay::ReplayGuard;
 use crate::selector::{build_dcid, parse_dcid, selector_matches, DcidParts, DCID_LEN};
@@ -111,20 +111,41 @@ enum Role {
 
 /// One authorized client's PSK and its PSK-rekeyed transport config.
 struct ClientCrypto {
+    client_id: String,
     psk: Psk,
     server_config: Arc<TransportServerConfig>,
 }
 
 /// Build one PSK-rekeyed transport `ServerConfig` per authorized client.
 fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigError> {
+    let mut client_ids = HashSet::new();
+    let mut psks = HashSet::new();
+    for entry in &secrets.clients {
+        if entry.client_id.trim().is_empty() {
+            return Err(ConfigError::Invalid("client_id must not be empty".into()));
+        }
+        if !client_ids.insert(entry.client_id.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate client_id {:?}",
+                entry.client_id
+            )));
+        }
+        if !psks.insert(*entry.psk.as_bytes()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate PSK makes client identity ambiguous (client_id {:?})",
+                entry.client_id
+            )));
+        }
+    }
+
     // A single self-signed identity is fine: the PSK — not the TLS certificate —
     // authenticates the peer (the client skips cert verification). One identity
     // shared across PSKs keeps setup trivial.
     let identity = SelfSigned::generate()
         .map_err(|e| ConfigError::Io(std::io::Error::other(format!("tls identity: {e}"))))?;
-    let quic_server = identity.quic_server_config().map_err(|e| {
-        ConfigError::Io(std::io::Error::other(format!("quic server config: {e}")))
-    })?;
+    let quic_server = identity
+        .quic_server_config()
+        .map_err(|e| ConfigError::Io(std::io::Error::other(format!("quic server config: {e}"))))?;
 
     let token_key = token_key();
 
@@ -134,6 +155,7 @@ fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigErr
         let crypto = Arc::new(PskServerConfig::new(quic_server.clone(), psk));
         let server_config = Arc::new(TransportServerConfig::new(crypto, token_key.clone()));
         clients.push(ClientCrypto {
+            client_id: entry.client_id.clone(),
             psk: entry.psk.clone(),
             server_config,
         });
@@ -192,6 +214,12 @@ pub struct Endpoint {
     /// Live connections, each wrapped in the [`ConnState`] that owns its
     /// per-stream bookkeeping.
     connections: HashMap<ConnectionHandle, ConnState>,
+    /// Authenticated server-side identity, derived from the unique PSK entry.
+    client_ids: HashMap<ConnectionHandle, String>,
+    /// Current generation-safe handle for each live Quinn slab handle.
+    by_quinn: HashMap<QuinnConnectionHandle, ConnectionHandle>,
+    /// Monotonic source for public handle generations. Zero is never issued.
+    next_generation: u64,
     /// Datagrams the caller should send, drained by [`Endpoint::poll_transmit`].
     outbound: VecDeque<Transmit>,
     /// Things the caller should react to, drained by [`Endpoint::poll_event`].
@@ -238,6 +266,9 @@ impl Endpoint {
             pending_cids,
             cids_by_conn: HashMap::new(),
             connections: HashMap::new(),
+            client_ids: HashMap::new(),
+            by_quinn: HashMap::new(),
+            next_generation: 1,
             outbound: VecDeque::new(),
             events: VecDeque::new(),
             next_timeout: None,
@@ -311,7 +342,7 @@ impl Endpoint {
 
         // A client endpoint has no server config: it never accepts.
         let mut inner = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, true, None);
-        let (ch, conn) = inner
+        let (quinn_ch, conn) = inner
             .connect(now, client_config, server_addr, SERVER_NAME)
             .map_err(|e| ConfigError::Io(std::io::Error::other(format!("connect: {e}"))))?;
 
@@ -325,6 +356,9 @@ impl Endpoint {
             pending_cids,
             cids_by_conn: HashMap::new(),
             connections: HashMap::new(),
+            client_ids: HashMap::new(),
+            by_quinn: HashMap::new(),
+            next_generation: 1,
             outbound: VecDeque::new(),
             events: VecDeque::new(),
             next_timeout: None,
@@ -335,6 +369,7 @@ impl Endpoint {
         };
         // `connect` minted this connection's initial local CID via the recorder;
         // attribute it to `ch` so it is pruned when the connection is lost.
+        let ch = endpoint.allocate_handle(quinn_ch);
         endpoint.drain_pending_cids(ch);
         endpoint.connections.insert(ch, ConnState::new(conn));
         endpoint.refresh_next_timeout();
@@ -358,6 +393,7 @@ impl Endpoint {
         from: SocketAddr,
         data: &[u8],
     ) -> DatagramOutcome {
+        let mut admitted_client = None;
         if self.role == Role::Server && !self.is_active_dcid(data) {
             // NEW-CONNECTION ATTEMPT: run the silence pre-filter.
             //
@@ -377,9 +413,10 @@ impl Endpoint {
             // derives the correct PSK Initial keys.
             self.inner
                 .set_server_config(Some(self.clients[client_idx].server_config.clone()));
+            admitted_client = Some(client_idx);
         }
 
-        let outcome = self.feed(now, from, data);
+        let outcome = self.feed(now, from, data, admitted_client);
         // The datagram was admitted, so whatever it unblocked — a handshake
         // step, stream data, a lifecycle transition — is turned into queued
         // transmits and events right here, before the caller polls either.
@@ -459,24 +496,19 @@ impl Endpoint {
     /// A `None` here after an [`Event::ConnectionLost`] is not an error: the
     /// endpoint has reaped the connection and the handle is dead.
     ///
-    /// # ⚠ A stale handle can return the WRONG connection
-    ///
-    /// `ConnectionHandle` is quinn-proto's slab index, and quinn-proto **reuses
-    /// a freed index for the next connection it accepts**. A handle is invalid
-    /// the moment [`Event::ConnectionLost`] is observed for it, and a `Some`
-    /// returned here for a handle that has since been lost may be a *different,
-    /// live* connection rather than `None` — silently, with no error.
-    ///
-    /// Callers that retain handles MUST therefore drain
-    /// [`Endpoint::poll_event`] and drop every handle named by an
-    /// [`Event::ConnectionLost`] **before** using any retained handle again.
-    /// `conn_mut` returning `Some` is not evidence that the handle you are
-    /// holding is still the connection you think it is.
-    ///
-    /// (The structural fix is a generation counter on the handle; it is a
-    /// deliberate follow-up, not implemented here.)
+    /// Handles are generation-tagged. After [`Event::ConnectionLost`], a stale
+    /// handle always returns `None`, even if Quinn has reused its internal slab
+    /// slot for a later connection.
     pub fn conn_mut(&mut self, ch: ConnectionHandle) -> Option<&mut ConnState> {
         self.connections.get_mut(&ch)
+    }
+
+    /// Authenticated server-side client identity for a live connection.
+    ///
+    /// The identity is the unique configuration entry whose PSK admitted the
+    /// connection. Client endpoints return `None`.
+    pub fn client_id(&self, ch: ConnectionHandle) -> Option<&str> {
+        self.client_ids.get(&ch).map(String::as_str)
     }
 
     /// How many connection IDs currently route to a live connection.
@@ -538,7 +570,13 @@ impl Endpoint {
     }
 
     /// Hand an admitted datagram to quinn-proto and queue anything it emits.
-    fn feed(&mut self, now: Instant, from: SocketAddr, data: &[u8]) -> DatagramOutcome {
+    fn feed(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        data: &[u8],
+        admitted_client: Option<usize>,
+    ) -> DatagramOutcome {
         let mut resp = Vec::new();
         let event = self
             .inner
@@ -566,15 +604,25 @@ impl Endpoint {
                 // server config installed), but accepting would be nonsense, so
                 // say so structurally rather than relying on that.
                 match self.role {
-                    Role::Server => self.admit(now, incoming),
+                    Role::Server => {
+                        let Some(client_idx) = admitted_client else {
+                            return DatagramOutcome::Dropped;
+                        };
+                        self.admit(now, incoming, client_idx)
+                    }
                     Role::Client => DatagramOutcome::Dropped,
                 }
             }
-            Some(DatagramEvent::ConnectionEvent(ch, cev)) => {
-                if let Some(state) = self.connections.get_mut(&ch) {
-                    state.conn_mut().handle_event(cev);
+            Some(DatagramEvent::ConnectionEvent(quinn_ch, cev)) => {
+                match self.by_quinn.get(&quinn_ch).copied() {
+                    Some(ch) => {
+                        if let Some(state) = self.connections.get_mut(&ch) {
+                            state.conn_mut().handle_event(cev);
+                        }
+                        DatagramOutcome::Accepted(ch)
+                    }
+                    None => DatagramOutcome::Dropped,
                 }
-                DatagramOutcome::Accepted(ch)
             }
             // Some `Response`s DO mint a CID: quinn-proto's `initial_close`
             // calls the CID generator for the close packet's source CID. No
@@ -597,10 +645,16 @@ impl Endpoint {
     }
 
     /// Accept an admitted incoming connection and register it.
-    fn admit(&mut self, now: Instant, incoming: quinn_proto::Incoming) -> DatagramOutcome {
+    fn admit(
+        &mut self,
+        now: Instant,
+        incoming: quinn_proto::Incoming,
+        client_idx: usize,
+    ) -> DatagramOutcome {
         let mut buf = Vec::new();
         match self.inner.accept(incoming, now, &mut buf, None) {
-            Ok((ch, conn)) => {
+            Ok((quinn_ch, conn)) => {
+                let ch = self.allocate_handle(quinn_ch);
                 if !buf.is_empty() {
                     self.outbound.push_back(Transmit {
                         destination: conn.remote_address(),
@@ -611,6 +665,8 @@ impl Endpoint {
                 // recorder; attribute them to `ch` for later pruning.
                 self.drain_pending_cids(ch);
                 self.connections.insert(ch, ConnState::new(conn));
+                self.client_ids
+                    .insert(ch, self.clients[client_idx].client_id.clone());
                 DatagramOutcome::Accepted(ch)
             }
             Err(_) => {
@@ -629,6 +685,20 @@ impl Endpoint {
                 DatagramOutcome::Dropped
             }
         }
+    }
+
+    /// Wrap a newly-created Quinn slab handle in a never-reused public
+    /// generation and register the live routing relation.
+    fn allocate_handle(&mut self, quinn: QuinnConnectionHandle) -> ConnectionHandle {
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("connection generation exhausted");
+        let handle = ConnectionHandle::new(quinn, generation);
+        let previous = self.by_quinn.insert(quinn, handle);
+        debug_assert!(previous.is_none(), "live Quinn handle unexpectedly reused");
+        handle
     }
 
     /// Pump every connection: route endpoint events, service streams into
@@ -653,7 +723,7 @@ impl Endpoint {
                 .get_mut(ch)
                 .and_then(|s| s.conn_mut().poll_endpoint_events())
             {
-                let cev = self.inner.handle_event(*ch, ev);
+                let cev = self.inner.handle_event(ch.quinn, ev);
                 self.drain_pending_cids(*ch);
                 if let Some(cev) = cev {
                     if let Some(state) = self.connections.get_mut(ch) {
@@ -738,6 +808,8 @@ impl Endpoint {
         //    connection's CONNECTION_CLOSE is already queued for the caller.
         for ch in lost {
             if self.connections.remove(&ch).is_some() {
+                self.by_quinn.remove(&ch.quinn);
+                self.client_ids.remove(&ch);
                 // The only place a CID leaves the routing set, and it runs
                 // strictly after the connection is gone, so no live CID is ever
                 // removed.
@@ -863,6 +935,43 @@ mod tests {
         Endpoint::new_server(secrets).expect("server endpoint")
     }
 
+    #[test]
+    fn duplicate_client_identity_or_psk_is_rejected() {
+        let duplicate_id: ServerSecrets = toml::from_str(
+            "listen=\"127.0.0.1:0\"\n\
+             [[clients]]\nclient_id=\"same\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000001\"\n\
+             [[clients]]\nclient_id=\"same\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000002\"\n",
+        )
+        .expect("parse");
+        assert!(matches!(
+            Endpoint::new_server(duplicate_id),
+            Err(ConfigError::Invalid(message)) if message.contains("duplicate client_id")
+        ));
+
+        let duplicate_psk: ServerSecrets = toml::from_str(
+            "listen=\"127.0.0.1:0\"\n\
+             [[clients]]\nclient_id=\"one\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000001\"\n\
+             [[clients]]\nclient_id=\"two\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000001\"\n",
+        )
+        .expect("parse");
+        assert!(matches!(
+            Endpoint::new_server(duplicate_psk),
+            Err(ConfigError::Invalid(message)) if message.contains("duplicate PSK")
+        ));
+    }
+
+    #[test]
+    fn generations_make_reused_quinn_slots_distinct() {
+        let mut ep = bare_server();
+        let raw = QuinnConnectionHandle(7);
+        let old = ep.allocate_handle(raw);
+        ep.by_quinn.remove(&raw);
+        let new = ep.allocate_handle(raw);
+        assert_ne!(old, new);
+        assert!(new.generation() > old.generation());
+        assert_eq!(ep.by_quinn.get(&raw), Some(&new));
+    }
+
     /// Simulate the endpoint minting CIDs for a connection by running a recorder
     /// wired to the same shared state the real generator uses. Callers then call
     /// `drain_pending_cids` exactly as the endpoint does after `accept` /
@@ -896,8 +1005,8 @@ mod tests {
     #[test]
     fn drain_attributes_minted_cids_to_the_connection_being_serviced() {
         let mut ep = bare_server();
-        let live = ConnectionHandle(1);
-        let doomed = ConnectionHandle(2);
+        let live = ConnectionHandle::new(QuinnConnectionHandle(1), 1);
+        let doomed = ConnectionHandle::new(QuinnConnectionHandle(2), 2);
 
         let live_cids = mint_for(&ep, 2);
         ep.drain_pending_cids(live);
@@ -916,8 +1025,8 @@ mod tests {
     #[test]
     fn prune_removes_only_the_lost_connections_cids() {
         let mut ep = bare_server();
-        let live = ConnectionHandle(1);
-        let doomed = ConnectionHandle(2);
+        let live = ConnectionHandle::new(QuinnConnectionHandle(1), 1);
+        let doomed = ConnectionHandle::new(QuinnConnectionHandle(2), 2);
 
         let live_cids = mint_for(&ep, 2);
         ep.drain_pending_cids(live);
@@ -945,9 +1054,9 @@ mod tests {
     fn pruning_an_unknown_handle_is_a_noop() {
         let mut ep = bare_server();
         let cids = mint_for(&ep, 2);
-        ep.drain_pending_cids(ConnectionHandle(1));
+        ep.drain_pending_cids(ConnectionHandle::new(QuinnConnectionHandle(1), 1));
 
-        ep.prune_connection_cids(ConnectionHandle(99));
+        ep.prune_connection_cids(ConnectionHandle::new(QuinnConnectionHandle(99), 99));
 
         let set = ep.issued_cids.lock().unwrap();
         for cid in &cids {
@@ -979,7 +1088,7 @@ mod tests {
     #[test]
     fn sweep_discards_orphans_and_leaves_attributed_cids_alone() {
         let mut ep = bare_server();
-        let live = ConnectionHandle(1);
+        let live = ConnectionHandle::new(QuinnConnectionHandle(1), 1);
 
         let live_cids = mint_for(&ep, 2);
         ep.drain_pending_cids(live);

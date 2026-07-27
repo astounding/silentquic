@@ -20,7 +20,9 @@ use silentquic::server::Server;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let listen = args.next().ok_or("usage: echo_server <listen_addr> <psk_hex> [client_id]")?;
+    let listen = args
+        .next()
+        .ok_or("usage: echo_server <listen_addr> <psk_hex> [client_id]")?;
     let psk = args.next().ok_or("missing <psk_hex> (64 hex chars)")?;
     let client_id = args.next().unwrap_or_else(|| "peer".to_string());
 
@@ -40,8 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("accepted connection from {}", conn.remote_address());
 
     let mut stream = conn.accept_stream().await?;
-    let got = stream.read_to_end().await?;
-    println!("received {} bytes: {:?}", got.len(), String::from_utf8_lossy(&got));
+    let got = stream.read_to_end(1024 * 1024).await?;
+    println!(
+        "received {} bytes: {:?}",
+        got.len(),
+        String::from_utf8_lossy(&got)
+    );
 
     // Echo back on the same stream. Safe because this is strictly sequential —
     // read to end, THEN write. Concurrent read+write on one stream is not
