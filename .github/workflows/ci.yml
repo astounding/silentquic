@@ -16,10 +16,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - run: cargo package -p silentquic-proto
+      - run: cargo package -p silentquic
       - uses: EmbarkStudios/cargo-deny-action@v2
         if: matrix.os == 'ubuntu-latest'
-      # The wrapper can be verified only after this exact proto version exists
-      # in the registry. The release checklist performs that ordered step.
       # The sans-IO core must stay drivable from a hand-rolled event loop, and
       # the reference loop is documentation people copy — so it is compiled and
       # RUN here, not merely built.

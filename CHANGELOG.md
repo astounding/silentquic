@@ -3,7 +3,7 @@
 All notable user-visible changes are recorded here. This project follows
 Semantic Versioning while its wire protocol and Rust API remain experimental.
 
-## 0.1.0-alpha.1 — unreleased
+## 0.1.0-alpha.1 — 2026-07-27
 
 - Split the Sans-I/O protocol core (`silentquic-proto`) from the Tokio wrapper.
 - Enforce silent rejection before allocating QUIC connection state.

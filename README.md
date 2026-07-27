@@ -1,8 +1,10 @@
 # silentquic
 
-** DISCLAIMER: ** This was 100% AI coded, prompted by the human "creator" but planned and designed by multiple AI models including those from Anthropic, Google, and OpenAI.  Trust at your own peril.
+**DISCLAIMER:** This was 100% AI coded, prompted by the human "creator" but
+planned and designed by multiple AI models including those from Anthropic,
+Google, and OpenAI. Trust at your own peril.
 
-> **Repository status & roadmap:** see [STATUS.md](STATUS.md). Historical
+> **Repository status:** see [STATUS.md](STATUS.md). Historical
 > decisions and corrections are summarized in [HISTORY.md](HISTORY.md).
 
 A cloaked QUIC transport library, in Rust: a server built on `silentquic` is
