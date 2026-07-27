@@ -4,16 +4,16 @@ version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.88"
 license = "0BSD"
-description = "Cloaked QUIC transport: scanner-invisible, PSK-authenticated, camouflaged as vanilla QUIC."
+description = "A PSK-authenticated variant of QUIC that remains silent to unauthorized connection attempts"
 documentation = "https://docs.rs/silentquic"
 repository = "https://github.com/astounding/silentquic"
 homepage = "https://github.com/astounding/silentquic"
 readme = "README.md"
-keywords = ["quic", "transport", "psk", "sans-io", "privacy"]
+keywords = ["quic", "transport", "psk", "privacy"]
 categories = ["network-programming", "cryptography"]
 
 # The root package is also the workspace root. `proto/` holds the sans-IO core
-# this crate wraps; see docs/specs/2026-07-05-silentquic-sans-io-core-design.md
+# this crate wraps; see docs/specs/2026-07-05-silentquic-core-design.md
 [workspace]
 members = ["proto"]
 
