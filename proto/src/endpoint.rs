@@ -3,7 +3,7 @@
 //!
 //! Nothing here performs I/O, spawns, blocks, or reads the monotonic clock. The
 //! caller owns the socket and passes `now` explicitly, which is what makes
-//! silentquic embeddable in a hand-rolled event loop (see
+//! quietquic embeddable in a hand-rolled event loop (see
 //! `examples/poll_loop.rs`).
 //!
 //! # The silence invariant

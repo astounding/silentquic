@@ -1,4 +1,4 @@
-# silentquic — Transport Seam & Silence Decision (Task 6 spike)
+# quietquic — Transport Seam & Silence Decision (Task 6 spike)
 
 **Date:** 2026-07-03
 **Status:** Spike complete — GREEN. Decision governs Tasks 7–9.

@@ -2,7 +2,7 @@
 //! Cloaked QUIC client — a tokio pump over the sans-IO core.
 //!
 //! Every seam that makes a dial *cloaked* rather than stock QUIC now lives in
-//! [`silentquic_proto::endpoint::Endpoint`]: the PSK-blinded selector DCID
+//! [`quietquic_proto::endpoint::Endpoint`]: the PSK-blinded selector DCID
 //! (`build_dcid(psk, nonce, freshness)` installed as the Initial DCID), the
 //! PSK-rekeyed Initial packet keys, the stock TLS 1.3 client crypto with
 //! certificate verification skipped (the PSK authenticates, not the cert), and
@@ -15,17 +15,17 @@
 //! `ClientDriver::run` is one `select!` over three wakeups — an inbound
 //! datagram, a handle command, and the connection timer — and each one is a
 //! single call into the core. Between wakeups, `ClientDriver::pump` drains the
-//! core in the order [`silentquic_proto::endpoint`] documents, **which is
+//! core in the order [`quietquic_proto::endpoint`] documents, **which is
 //! load-bearing**:
 //!
 //! 1. feed datagrams / fire timers / apply commands (the `select!` arms),
-//! 2. drain [`Endpoint::poll_event`](silentquic_proto::endpoint::Endpoint::poll_event)
+//! 2. drain [`Endpoint::poll_event`](quietquic_proto::endpoint::Endpoint::poll_event)
 //!    and do the stream work each event unblocks,
-//! 3. drain [`Endpoint::poll_transmit`](silentquic_proto::endpoint::Endpoint::poll_transmit)
+//! 3. drain [`Endpoint::poll_transmit`](quietquic_proto::endpoint::Endpoint::poll_transmit)
 //!    to `None` — **after** the stream work of this pass, because that is what
 //!    carries a read's released flow-control credit to the peer,
 //! 4. and only then read
-//!    [`Endpoint::next_timeout`](silentquic_proto::endpoint::Endpoint::next_timeout)
+//!    [`Endpoint::next_timeout`](quietquic_proto::endpoint::Endpoint::next_timeout)
 //!    to arm the sleep.
 //!
 //! Draining transmits before stream work is the classic sans-IO stall: the
@@ -37,7 +37,7 @@
 //! A client endpoint has no server config, so any short-header datagram with an
 //! unrecognized 8-byte DCID reaches quinn-proto's stateless-reset path. The core
 //! gates endpoint-level responses on role — it emits one only for a
-//! [`Role::Server`](silentquic_proto::endpoint) — so a client feeding such a
+//! [`Role::Server`](quietquic_proto::endpoint) — so a client feeding such a
 //! datagram queues nothing and this pump cannot emit an unsolicited packet even
 //! by mistake. That closes a small reflection primitive the previous
 //! hand-rolled driver had: it forwarded quinn-proto's endpoint response to the
@@ -51,10 +51,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use silentquic_proto::endpoint::Endpoint as Core;
-use silentquic_proto::freshness::now_minutes;
-use silentquic_proto::outcome::ConnectionHandle;
-use silentquic_proto::outcome::Event as CoreEvent;
+use quietquic_proto::endpoint::Endpoint as Core;
+use quietquic_proto::freshness::now_minutes;
+use quietquic_proto::outcome::ConnectionHandle;
+use quietquic_proto::outcome::Event as CoreEvent;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 

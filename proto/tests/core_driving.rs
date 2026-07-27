@@ -21,8 +21,8 @@
 
 use quinn_proto::{Dir, Side};
 
-use silentquic_proto::outcome::{ReadOutcome, WriteOutcome};
-use silentquic_proto::testing::connected_pair;
+use quietquic_proto::outcome::{ReadOutcome, WriteOutcome};
+use quietquic_proto::testing::connected_pair;
 
 // ---------------------------------------------------------------------------
 // The dirty guarantee

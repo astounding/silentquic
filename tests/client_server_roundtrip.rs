@@ -17,10 +17,10 @@
 //! This is the project's first end-to-end data-flow proof. It also asserts the
 //! `quinn_connection()` forward-compat escape hatch is reachable.
 
-use silentquic::client::Client;
-use silentquic::config::{ClientConfigFile, ServerSecrets};
-use silentquic::conn::ConnError;
-use silentquic::server::Server;
+use quietquic::client::Client;
+use quietquic::config::{ClientConfigFile, ServerSecrets};
+use quietquic::conn::ConnError;
+use quietquic::server::Server;
 
 #[tokio::test]
 async fn authorized_client_completes_handshake_over_udp() {

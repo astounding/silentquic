@@ -2,7 +2,7 @@
 
 ## Release status
 
-SilentQUIC `0.1.x` is experimental security software. Its implementation has
+QuietQUIC `0.1.x` is experimental security software. Its implementation has
 extensive automated tests, known-answer vectors, and fuzz targets, but the
 protocol has not yet received an independent cryptographic review. It should
 not be represented as production-hardened.
@@ -15,7 +15,7 @@ denial of service.
 ## Reporting a vulnerability
 
 Do not open a public issue containing exploit details. Email reports privately
-to [silentquic.astounding@sierrasand.com](mailto:silentquic.astounding@sierrasand.com).
+to [quietquic.astounding@sierrasand.com](mailto:quietquic.astounding@sierrasand.com).
 
 Include affected versions, reproduction steps, expected impact, and whether
 the issue can violate the no-reply invariant. Please allow up to five business

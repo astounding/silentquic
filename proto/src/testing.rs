@@ -16,7 +16,7 @@
 //! It is not gated behind a `testing` feature, for two reasons. First, a feature
 //! only this crate's own integration tests could turn on would need a
 //! self-referential dev-dependency to work — real complexity for no benefit.
-//! Second, the audience is wider than this crate: silentquic's whole point is
+//! Second, the audience is wider than this crate: quietquic's whole point is
 //! that an embedder can drive the core from a hand-rolled event loop, and an
 //! embedder who does that needs a way to test their loop against a live peer
 //! without opening a socket. [`Pair`] is that.

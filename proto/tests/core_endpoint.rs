@@ -5,16 +5,16 @@
 //! `core_streams.rs` deliberately drives a *stock* quinn-proto pair, because its
 //! unit under test (`ConnState`) is transport-agnostic. This file is the other
 //! half: every datagram here passes through
-//! [`silentquic_proto::endpoint::Endpoint::handle_datagram`], so the blinded
+//! [`quietquic_proto::endpoint::Endpoint::handle_datagram`], so the blinded
 //! selector DCID, the PSK-rekeyed Initial, the freshness/replay gates and the
 //! rate limiter are all genuinely in the loop. If cloaking breaks, these fail.
 //!
-//! [`Endpoint`]: silentquic_proto::endpoint::Endpoint
+//! [`Endpoint`]: quietquic_proto::endpoint::Endpoint
 
 use quinn_proto::{Side, VarInt};
 
-use silentquic_proto::outcome::Event;
-use silentquic_proto::testing::{connected_pair, Pair};
+use quietquic_proto::outcome::Event;
+use quietquic_proto::testing::{connected_pair, Pair};
 
 /// Bound on timer-firing passes when reaping a closed connection. A close timer
 /// settles in a couple; this only exists so a regression fails fast.

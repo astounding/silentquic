@@ -15,18 +15,18 @@ jobs:
       - run: cargo test --workspace --doc
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      - run: cargo package -p silentquic-proto
-      - run: cargo package -p silentquic
+      - run: cargo package -p quietquic-proto
+      - run: cargo package -p quietquic
       - uses: EmbarkStudios/cargo-deny-action@v2
         if: matrix.os == 'ubuntu-latest'
       # The sans-IO core must stay drivable from a hand-rolled event loop, and
       # the reference loop is documentation people copy — so it is compiled and
       # RUN here, not merely built.
-      - run: cargo run -p silentquic-proto --example poll_loop
+      - run: cargo run -p quietquic-proto --example poll_loop
       # The core must never grow a runtime dependency; that is the whole point
       # of the crate split.
-      - name: silentquic-proto has no tokio
-        run: "! cargo tree -p silentquic-proto | grep -qi tokio"
+      - name: quietquic-proto has no tokio
+        run: "! cargo tree -p quietquic-proto | grep -qi tokio"
   freebsd:
     runs-on: ubuntu-latest
     steps:
@@ -40,4 +40,4 @@ jobs:
           run: |
             cargo test --workspace --all-targets
             cargo test --workspace --doc
-            cargo run -p silentquic-proto --example poll_loop
+            cargo run -p quietquic-proto --example poll_loop

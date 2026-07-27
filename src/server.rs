@@ -2,7 +2,7 @@
 //! Scanner-invisible cloaked QUIC server — a tokio pump over the sans-IO core.
 //!
 //! Every line of protocol logic this module used to carry now lives in
-//! [`silentquic_proto::endpoint::Endpoint`]: the silence pre-filter (rate
+//! [`quietquic_proto::endpoint::Endpoint`]: the silence pre-filter (rate
 //! limiter → long-header parse → selector length → PSK match → freshness →
 //! anti-replay), the CID routing set that lets post-handshake packets bypass
 //! that pre-filter, the per-PSK transport configs, connection admission,
@@ -15,17 +15,17 @@
 //! `Driver::run` is one `select!` over four wakeups — an inbound datagram, a
 //! handle command, the connection timer, and accept-channel capacity — and each
 //! one is a single call into the core. Between wakeups, `Driver::pump` drains
-//! the core in the order [`silentquic_proto::endpoint`] documents, **which is
+//! the core in the order [`quietquic_proto::endpoint`] documents, **which is
 //! load-bearing**:
 //!
 //! 1. feed datagrams / fire timers / apply commands (the `select!` arms),
-//! 2. drain [`Endpoint::poll_event`](silentquic_proto::endpoint::Endpoint::poll_event)
+//! 2. drain [`Endpoint::poll_event`](quietquic_proto::endpoint::Endpoint::poll_event)
 //!    and do the stream work each event unblocks,
-//! 3. drain [`Endpoint::poll_transmit`](silentquic_proto::endpoint::Endpoint::poll_transmit)
+//! 3. drain [`Endpoint::poll_transmit`](quietquic_proto::endpoint::Endpoint::poll_transmit)
 //!    to `None` — **after** the stream work of this pass, because that is what
 //!    carries a read's released flow-control credit to the peer,
 //! 4. and only then read
-//!    [`Endpoint::next_timeout`](silentquic_proto::endpoint::Endpoint::next_timeout)
+//!    [`Endpoint::next_timeout`](quietquic_proto::endpoint::Endpoint::next_timeout)
 //!    to arm the sleep.
 //!
 //! Draining transmits before stream work is the classic sans-IO stall: the
@@ -40,7 +40,7 @@
 //! there is nothing for `poll_transmit` to hand back and this driver cannot
 //! reply to an unauthorized peer even by mistake. Note the corollary that shapes
 //! the code below: the driver **never branches its sends on
-//! [`DatagramOutcome`](silentquic_proto::outcome::DatagramOutcome)**. `Dropped`
+//! [`DatagramOutcome`](quietquic_proto::outcome::DatagramOutcome)**. `Dropped`
 //! does not mean "nothing queued" (an authorized peer asking for an unsupported
 //! QUIC version earns a Version Negotiation packet *and* a `Dropped`), so the
 //! outcome is discarded and `poll_transmit` is always drained.
@@ -50,9 +50,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use silentquic_proto::endpoint::Endpoint as Core;
-use silentquic_proto::outcome::ConnectionHandle;
-use silentquic_proto::outcome::Event as CoreEvent;
+use quietquic_proto::endpoint::Endpoint as Core;
+use quietquic_proto::outcome::ConnectionHandle;
+use quietquic_proto::outcome::Event as CoreEvent;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 

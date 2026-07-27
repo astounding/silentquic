@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: 0BSD
-//! Sans-IO core for silentquic.
+//! Sans-IO core for quietquic.
 //!
 //! This crate performs no I/O, spawns no tasks, requires no async runtime, and
 //! never blocks or parks. The caller owns the socket and the clock and drives
-//! the state machine directly, which makes silentquic embeddable in a
+//! the state machine directly, which makes quietquic embeddable in a
 //! hand-rolled event loop — including the classic Unix reactor that calls
 //! `select()` with a zero timeout and has other work to do between passes.
 //! See `examples/poll_loop.rs` for the reference shape.
 //!
-//! The [`silentquic`](https://docs.rs/silentquic) crate is a thin tokio wrapper
+//! The [`quietquic`](https://docs.rs/quietquic) crate is a thin tokio wrapper
 //! over this core; applications that want async/await should use that instead.
 //!
 //! # Threat model

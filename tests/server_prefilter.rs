@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: 0BSD
 //! Server pre-filter integration + `peek_dcid` unit tests.
 
-use silentquic::transport::peek_dcid;
+use quietquic::transport::peek_dcid;
 
 #[test]
 fn peek_dcid_extracts_from_long_header() {
@@ -27,9 +27,9 @@ fn peek_dcid_rejects_short_or_short_header() {
 
 use std::time::Duration;
 
-use silentquic::config::ServerSecrets;
-use silentquic::selector::{build_dcid, DCID_LEN};
-use silentquic::server::Server;
+use quietquic::config::ServerSecrets;
+use quietquic::selector::{build_dcid, DCID_LEN};
+use quietquic::server::Server;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -142,8 +142,8 @@ fn now_minute() -> u32 {
 // afterward — the server must remain live under flood.
 // ---------------------------------------------------------------------------
 
-use silentquic::client::Client;
-use silentquic::config::ClientConfigFile;
+use quietquic::client::Client;
+use quietquic::config::ClientConfigFile;
 
 /// Flood the server with thousands of junk datagrams from one source, then
 /// prove: (a) the flood itself gets zero replies (rate-limited drops are

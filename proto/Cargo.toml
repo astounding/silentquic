@@ -1,20 +1,20 @@
 [package]
-name = "silentquic-proto"
+name = "quietquic-proto"
 version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.88"
 license = "0BSD"
-description = "Sans-IO core for silentquic: cloaked QUIC protocol state machine with no I/O, no runtime, and no threads."
-documentation = "https://docs.rs/silentquic-proto"
-repository = "https://github.com/astounding/silentquic"
-homepage = "https://github.com/astounding/silentquic"
+description = "Sans-IO core for quietquic: cloaked QUIC protocol state machine with no I/O, no runtime, and no threads."
+documentation = "https://docs.rs/quietquic-proto"
+repository = "https://github.com/astounding/quietquic"
+homepage = "https://github.com/astounding/quietquic"
 readme = "../README.md"
 keywords = ["quic", "transport", "psk", "sans-io", "privacy"]
 categories = ["network-programming", "cryptography"]
 
 # NOTE: there is deliberately NO `tokio` dependency here, and none may be added.
 # This crate performs no I/O, spawns nothing, and never blocks, so that callers
-# can drive it from their own event loop. `cargo tree -p silentquic-proto` must
+# can drive it from their own event loop. `cargo tree -p quietquic-proto` must
 # never mention tokio.
 [dependencies]
 aws-lc-rs = "1"

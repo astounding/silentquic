@@ -1,4 +1,4 @@
-# silentquic — Design Spec
+# quietquic — Design Spec
 
 **Date:** 2026-07-03
 **Status:** Approved design, pre-implementation
@@ -12,20 +12,20 @@
 This is **Project A** of a two-project effort. The projects are deliberately
 separated along a thin, one-directional interface:
 
-- **Project A — `silentquic` (this spec):** a standalone Rust library providing a
+- **Project A — `quietquic` (this spec):** a standalone Rust library providing a
   *cloaked* QUIC transport. A server built on it is invisible to network scanners
   and its traffic camouflages as ordinary QUIC/HTTP3. It authenticates and selects
   a per-client pre-shared key (PSK) entirely within the QUIC `Initial` packet, then
   exposes plain authenticated byte streams. **It contains no backup logic.**
 
 - **Project B — the backup system (separate spec, later):** a zero-knowledge,
-  deduplicating backup tool (borg/tarsnap/restic-inspired). It consumes `silentquic`
+  deduplicating backup tool (borg/tarsnap/restic-inspired). It consumes `quietquic`
   as its *flagship* transport through a narrow transport trait, alongside portable
   transports (SFTP/WebDAV/SMB/S3/local via OpenDAL).
 
 The dependency is **one-directional and late-binding**: Project B depends on
 Project A only through a `send bytes / open stream` abstraction, so B can be built
-and hardened against portable transports first and adopt `silentquic` when ready.
+and hardened against portable transports first and adopt `quietquic` when ready.
 Project A is designed and built first because it carries the highest technical risk
 (mangling QUIC's `Initial` derivation cleanly) and has a crisp, provable success
 test independent of any backup code.
@@ -34,7 +34,7 @@ test independent of any backup code.
 
 ## 2. Purpose & Scope
 
-`silentquic` provides a **cloaked QUIC transport library**:
+`quietquic` provides a **cloaked QUIC transport library**:
 
 - A server that emits **zero bytes** in response to any packet that does not prove
   possession of a valid PSK — indistinguishable from a closed/filtered UDP port to a
@@ -65,7 +65,7 @@ test independent of any backup code.
 Stated plainly, and to be reproduced in the library's user-facing docs so no operator
 over-trusts it.
 
-### What silentquic defeats
+### What quietquic defeats
 
 - **Internet-wide active scanning** (nmap, zmap, masscan) and search engines
   (Shodan, Censys): the server never responds to an unauthorized probe, so it appears
@@ -74,7 +74,7 @@ over-trusts it.
 - **Netflow / flow-log classification** and **casual DPI**: traffic looks like a normal
   QUIC connection to some IP on UDP/443.
 
-### What silentquic does NOT defeat
+### What quietquic does NOT defeat
 
 - **Global passive traffic analysis.** Backups are large and periodic; the *volume and
   timing pattern* of traffic to a fixed endpoint leaks even when service identity and
@@ -82,7 +82,7 @@ over-trusts it.
 - **Sophisticated DPI that actively attempts `Initial` decryption on every flow.** In
   stock QUIC, the `Initial` packet is protected with keys derived from a *published*
   version salt plus the on-wire Destination Connection ID (DCID), so any observer can
-  unseal it and read the TLS ClientHello. Because silentquic **re-keys the `Initial`
+  unseal it and read the TLS ClientHello. Because quietquic **re-keys the `Initial`
   with the PSK**, such an observer's unseal attempt produces garbage — revealing
   "QUIC whose Initial won't decrypt," an anomaly resembling an unknown/broken QUIC
   variant. This is the irreducible cost of folding authentication into the `Initial`;
@@ -93,7 +93,7 @@ over-trusts it.
   CPU/memory to process-then-drop junk packets. An attacker flooding the host and
   watching an *unrelated* co-located service's latency can infer that something is
   doing per-packet crypto work. Mitigations (below) bound and flatten this channel but
-  cannot close it. **Recommended deployment: silentquic is the only service on its
+  cannot close it. **Recommended deployment: quietquic is the only service on its
   host.**
 
 ---
@@ -114,7 +114,7 @@ response.
   ```
 
   where `nonce` is fresh random bytes per connection, `freshness` is a coarse timestamp,
-  and `context` is a fixed domain-separation string (`b"silentquic/v1/selector"`). The
+  and `context` is a fixed domain-separation string (`b"quietquic/v1/selector"`). The
   MAC input order (context first) is canonical and fixed by the implementation; the
   server recomputes it identically.
 
@@ -177,7 +177,7 @@ selector construction**. The design must not foreclose this.
 - The underlying **`quinn::Connection` remains reachable**, so `h3` or any other
   stream protocol can be layered later **without modifying the cloaking layer**.
 - **Architectural principle:** *cloaking is a property of connection establishment
-  only.* silentquic re-keys the `Initial`, authenticates via the blinded DCID selector,
+  only.* quietquic re-keys the `Initial`, authenticates via the blinded DCID selector,
   and drops silently — but once a connection is established it is ordinary QUIC.
 - **Async runtime: tokio** (quinn's runtime; the practical default). The reject path
   remains cheap and bounded regardless of runtime.
@@ -240,7 +240,7 @@ A security library; the test suite is a headline deliverable, not an afterthough
 
 ## 10. Success Criteria
 
-1. A `silentquic` server, scanned by nmap/zmap/masscan and probed by a stock QUIC
+1. A `quietquic` server, scanned by nmap/zmap/masscan and probed by a stock QUIC
    client, returns **zero bytes** and is indistinguishable from a closed UDP port.
 2. A client holding a valid PSK establishes a connection and exchanges data over
    bidirectional streams.

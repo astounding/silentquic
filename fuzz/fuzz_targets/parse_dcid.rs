@@ -11,5 +11,5 @@ use libfuzzer_sys::fuzz_target;
 // allocate on reject (it only ever copies into fixed-size stack arrays), and
 // always return in bounded time (no loops, pure slice indexing via `Option`).
 fuzz_target!(|data: &[u8]| {
-    let _ = silentquic::selector::parse_dcid(data);
+    let _ = quietquic::selector::parse_dcid(data);
 });

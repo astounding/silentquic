@@ -14,8 +14,8 @@
 
 use std::time::Duration;
 
-use silentquic::config::ServerSecrets;
-use silentquic::server::Server;
+use quietquic::config::ServerSecrets;
+use quietquic::server::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

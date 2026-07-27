@@ -1,4 +1,4 @@
-# silentquic
+# quietquic
 
 **DISCLAIMER:** This was 100% AI coded, prompted by the human "creator" but
 planned and designed by multiple AI models including those from Anthropic,
@@ -7,7 +7,7 @@ Google, and OpenAI. Trust at your own peril.
 > **Repository status:** see [STATUS.md](STATUS.md). Historical
 > decisions and corrections are summarized in [HISTORY.md](HISTORY.md).
 
-A cloaked QUIC transport library, in Rust: a server built on `silentquic` is
+A cloaked QUIC transport library, in Rust: a server built on `quietquic` is
 **invisible to network scanners** — it emits zero bytes in response to any
 packet that doesn't prove possession of a valid pre-shared key (PSK) — and its
 traffic **camouflages as ordinary QUIC v1/HTTP3**, blending into the large
@@ -16,7 +16,7 @@ volume of legitimate internet QUIC. Authentication and per-client key
 traffic is rejected before any connection state is allocated and before any
 byte is sent back.
 
-`silentquic` is a standalone transport library. It contains no application
+`quietquic` is a standalone transport library. It contains no application
 logic; it exposes raw authenticated bidirectional byte streams for a caller
 (e.g. a backup tool, a config-push agent, anything that wants a QUIC pipe that
 doesn't advertise itself to the internet) to frame however it likes.
@@ -29,8 +29,8 @@ doesn't advertise itself to the internet) to frame however it likes.
 
 | Crate | What it is | Use it when |
 |---|---|---|
-| **`silentquic-proto`** (`proto/`) | The **sans-IO core**. No I/O, no async runtime, no threads, and it never blocks or reads the clock — you own the socket and pass `now` in. | You have your own event loop, or you're embedding via FFI |
-| **`silentquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `async` `Server`/`Client`/`Connection`/`Stream`. | Your application is already `async`/`.await` |
+| **`quietquic-proto`** (`proto/`) | The **sans-IO core**. No I/O, no async runtime, no threads, and it never blocks or reads the clock — you own the socket and pass `now` in. | You have your own event loop, or you're embedding via FFI |
+| **`quietquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `async` `Server`/`Client`/`Connection`/`Stream`. | Your application is already `async`/`.await` |
 
 This mirrors `quinn-proto`/`quinn`, and it exists because the two I/O models are
 mutually exclusive: tokio owns the thread and parks in `epoll`/`kqueue` when
@@ -50,7 +50,7 @@ an unauthorized peer, even by mistake. Invisibility is a property of the API
 rather than of the caller's control flow.
 
 Full design rationale lives in
-[`docs/specs/2026-07-03-silentquic-design.md`](docs/specs/2026-07-03-silentquic-design.md).
+[`docs/specs/2026-07-03-quietquic-design.md`](docs/specs/2026-07-03-quietquic-design.md).
 See the [`docs` map](docs/README.md) for the distinction between current
 normative documentation and archived implementation plans.
 This README's Threat Model section below reproduces the spec's threat model
@@ -104,8 +104,8 @@ server = "203.0.113.7:443"
 ### 4. Server: bind and accept connections
 
 ```rust
-use silentquic::config::{FileSource, SecretSource};
-use silentquic::server::Server;
+use quietquic::config::{FileSource, SecretSource};
+use quietquic::server::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -131,8 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 5. Client: connect and open a stream
 
 ```rust
-use silentquic::client::Client;
-use silentquic::config::ClientConfigFile;
+use quietquic::client::Client;
+use quietquic::config::ClientConfigFile;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -157,7 +157,7 @@ For full-duplex or untrusted-size traffic, split the stream and read
 incrementally:
 
 ```rust,no_run
-# async fn relay(stream: silentquic::conn::Stream) -> Result<(), silentquic::conn::ConnError> {
+# async fn relay(stream: quietquic::conn::Stream) -> Result<(), quietquic::conn::ConnError> {
 let (mut recv, mut send) = stream.split();
 let reader = async move {
     loop {
@@ -167,7 +167,7 @@ let reader = async move {
         }
         println!("received {} bytes", chunk.len());
     }
-    Ok::<_, silentquic::conn::ConnError>(())
+    Ok::<_, quietquic::conn::ConnError>(())
 };
 let writer = async move {
     send.write_all(b"request").await?;
@@ -195,7 +195,7 @@ See [Limitations](#limitations--not-yet-production-hardened) below.
 Stated plainly here so no operator over-trusts this library. (Reproduced from
 the design spec, §3.)
 
-### What silentquic defeats
+### What quietquic defeats
 
 - **Internet-wide active scanning** (nmap, zmap, masscan) and search engines
   (Shodan, Censys): the server never responds to an unauthorized probe, so it
@@ -205,7 +205,7 @@ the design spec, §3.)
 - **Netflow / flow-log classification** and **casual DPI**: traffic looks like
   a normal QUIC connection to some IP on UDP/443.
 
-### What silentquic does NOT defeat
+### What quietquic does NOT defeat
 
 - **Global passive traffic analysis.** Backups (or any bulk transfer) are
   large and periodic; the *volume and timing pattern* of traffic to a fixed
@@ -215,7 +215,7 @@ the design spec, §3.)
   flow.** In stock QUIC, the `Initial` packet is protected with keys derived
   from a *published* version salt plus the on-wire Destination Connection ID
   (DCID), so any observer can unseal it and read the TLS ClientHello. Because
-  silentquic **re-keys the `Initial` with the PSK**, such an observer's unseal
+  quietquic **re-keys the `Initial` with the PSK**, such an observer's unseal
   attempt produces garbage — revealing "QUIC whose Initial won't decrypt," an
   anomaly resembling an unknown/broken QUIC variant. This is the irreducible
   cost of folding authentication into the `Initial`; it cannot be avoided
@@ -230,7 +230,7 @@ the design spec, §3.)
   unseal; per-source and global rate limits) bound and flatten this channel
   but cannot close it.
 
-  **Recommended deployment: run silentquic as the only service on its host.**
+  **Recommended deployment: run quietquic as the only service on its host.**
 
 ---
 

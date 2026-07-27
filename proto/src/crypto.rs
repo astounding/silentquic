@@ -5,7 +5,7 @@
 //!
 //! The reset key and handshake-token key are random per-process secrets, so
 //! stateless-reset and address-validation tokens are unpredictable. Note that a
-//! silent silentquic server never emits resets or Retries to unauthenticated
+//! silent quietquic server never emits resets or Retries to unauthenticated
 //! peers, so these gate nothing observable by a scanner; they exist because
 //! quinn-proto requires them.
 //!
@@ -166,7 +166,7 @@ impl SelfSigned {
 /// Stock rustls TLS 1.3 client crypto, with server-certificate verification
 /// **skipped**.
 ///
-/// This is deliberate and is not a weakening: in silentquic the **PSK**
+/// This is deliberate and is not a weakening: in quietquic the **PSK**
 /// authenticates the peer, both at the outer layer (only a server holding the
 /// PSK can derive the Initial keys that unseal our ClientHello, so a wrong
 /// server cannot even reply intelligibly) and by construction of the selector

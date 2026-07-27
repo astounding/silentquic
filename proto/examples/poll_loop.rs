@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: 0BSD
-//! Reference: driving silentquic from a hand-rolled, **zero-timeout** event loop.
+//! Reference: driving quietquic from a hand-rolled, **zero-timeout** event loop.
 //!
 //! This is the classic Unix reactor shape — a single thread that polls its
 //! sockets without ever blocking, services whatever is ready, and then gets on
 //! with its own work. No async runtime, no threads, no `.await`, nothing that
-//! parks. Contrast `silentquic`, the tokio wrapper, which is the right choice if
+//! parks. Contrast `quietquic`, the tokio wrapper, which is the right choice if
 //! your application is already async.
 //!
 //! To keep the example self-contained it drives **both** ends — a cloaked server
@@ -43,17 +43,17 @@
 //! wrap the same thing in `select()`/`poll()`/`kqueue` with a zero timeout, then
 //! read whichever are ready — the structure below is unchanged.
 //!
-//! Run with: `cargo run -p silentquic-proto --example poll_loop`
+//! Run with: `cargo run -p quietquic-proto --example poll_loop`
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Instant;
 
+use quietquic_proto::config::{ClientConfigFile, ServerSecrets};
+use quietquic_proto::endpoint::Endpoint;
+use quietquic_proto::freshness::now_minutes;
+use quietquic_proto::outcome::{ConnectionHandle, Event, ReadOutcome};
 use quinn_proto::StreamId;
-use silentquic_proto::config::{ClientConfigFile, ServerSecrets};
-use silentquic_proto::endpoint::Endpoint;
-use silentquic_proto::freshness::now_minutes;
-use silentquic_proto::outcome::{ConnectionHandle, Event, ReadOutcome};
 
 /// A 64-hex-character pre-shared key, shared by both ends.
 const PSK_HEX: &str = "00000000000000000000000000000000000000000000000000000000000000bb";

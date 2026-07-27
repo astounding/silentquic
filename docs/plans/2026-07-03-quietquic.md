@@ -1,4 +1,4 @@
-# silentquic Implementation Plan
+# quietquic Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -17,7 +17,7 @@
 - **Auth model:** per-client PSKs held in an explicit set now; design must not foreclose a future `psk = HKDF(root, client_id)` derive-from-root scheme (localized to key *lookup*, no wire-format/selector change).
 - **DCID budget:** QUIC v1 max Connection ID length is 20 bytes; quinn requires the client initial DCID be ≥ 8 bytes and unpredictable. Layout MUST fit in exactly 20 bytes: `nonce (8) ‖ freshness (4, u32 LE minutes-since-epoch) ‖ selector (8)`.
 - **Reject path:** on unauthorized packets, no heap allocation, no secret-dependent branching beyond the bounded MAC compare, bounded by per-source + global rate limits / CPU budget.
-- **PSK size:** 32 bytes. `context` is a fixed domain-separation constant `b"silentquic/v1/selector"`.
+- **PSK size:** 32 bytes. `context` is a fixed domain-separation constant `b"quietquic/v1/selector"`.
 - **Secrets:** stored as plain TOML, `chmod 600`, loaded through a `SecretSource` trait (v1: `FileSource`). Secrets wrapped in `zeroize`-ing types; never logged.
 - **TDD:** every task writes a failing test first, watches it fail, implements minimally, watches it pass, commits.
 
@@ -33,13 +33,13 @@
 - Create: `rust-toolchain.toml`
 
 **Interfaces:**
-- Produces: an empty compiling library crate named `silentquic`, module skeleton declared (`selector`, `freshness`, `replay`, `initial_keys`, `config`, `transport`, `server`, `client`), CI running `cargo test` + `cargo clippy` on Linux/macOS/FreeBSD.
+- Produces: an empty compiling library crate named `quietquic`, module skeleton declared (`selector`, `freshness`, `replay`, `initial_keys`, `config`, `transport`, `server`, `client`), CI running `cargo test` + `cargo clippy` on Linux/macOS/FreeBSD.
 
 - [ ] **Step 1: Write `Cargo.toml`**
 
 ```toml
 [package]
-name = "silentquic"
+name = "quietquic"
 version = "0.0.0"
 edition = "2021"
 license = "0BSD"
@@ -69,9 +69,9 @@ Note: pin exact minor versions during implementation with `cargo add`; the spike
 
 ```rust
 // SPDX-License-Identifier: 0BSD
-//! silentquic — a cloaked QUIC transport.
+//! quietquic — a cloaked QUIC transport.
 //!
-//! See `docs/superpowers/specs/2026-07-03-silentquic-design.md` for the threat
+//! See `docs/superpowers/specs/2026-07-03-quietquic-design.md` for the threat
 //! model. In particular: this defeats scanning and casual DPI, NOT global
 //! passive traffic analysis, active per-flow Initial decryption, or a resource
 //! side-channel via a co-located service. Run it as the only service on its host.
@@ -133,7 +133,7 @@ Expected: builds clean, 0 tests run.
 
 ```bash
 git add Cargo.toml Cargo.lock src/ rust-toolchain.toml .github/
-git commit -m "feat: scaffold silentquic crate with CI matrix"
+git commit -m "feat: scaffold quietquic crate with CI matrix"
 ```
 
 ---
@@ -147,7 +147,7 @@ git commit -m "feat: scaffold silentquic crate with CI matrix"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `pub const CONTEXT: &[u8] = b"silentquic/v1/selector";`
+  - `pub const CONTEXT: &[u8] = b"quietquic/v1/selector";`
   - `pub const DCID_LEN: usize = 20;`
   - `pub struct DcidParts { pub nonce: [u8; 8], pub freshness: u32, pub selector: [u8; 8] }`
   - `pub fn compute_selector(psk: &[u8; 32], nonce: &[u8; 8], freshness: u32) -> [u8; 8]`
@@ -217,7 +217,7 @@ Expected: FAIL — items not defined.
 // SPDX-License-Identifier: 0BSD
 //! Blinded DCID selector: embeds per-client key selection into the QUIC DCID.
 
-pub const CONTEXT: &[u8] = b"silentquic/v1/selector";
+pub const CONTEXT: &[u8] = b"quietquic/v1/selector";
 pub const DCID_LEN: usize = 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -685,7 +685,7 @@ git commit -m "feat: TOML config with SecretSource seam and zeroizing Psk"
 **Files:**
 - Create: `src/initial_keys.rs`
 - Create: `tests/spike_silence.rs`
-- Create: `docs/superpowers/notes/silentquic-transport-decision.md` (record the outcome)
+- Create: `docs/superpowers/notes/quietquic-transport-decision.md` (record the outcome)
 
 **Interfaces (target — confirm/adjust during spike):**
 - Produces: `pub fn initial_keys_from_psk(psk: &[u8; 32], dcid: &[u8], side: Side, version: u32) -> quinn_proto::crypto::Keys` — RFC 9001 Initial key derivation with `psk` used as the HKDF salt in place of the QUIC v1 published salt.
@@ -742,7 +742,7 @@ git commit -m "spike: prove pre-filter silence and PSK Initial re-keying over qu
 
 ```rust
 // tests/server_prefilter.rs
-use silentquic::transport::peek_dcid;
+use quietquic::transport::peek_dcid;
 
 #[test]
 fn peek_dcid_extracts_from_long_header() {
@@ -841,7 +841,7 @@ git commit -m "feat: server UDP loop with silent selector pre-filter"
 
 ```rust
 // tests/client_server_roundtrip.rs
-use silentquic::{client::Client, server::Server, config::*};
+use quietquic::{client::Client, server::Server, config::*};
 
 #[tokio::test]
 async fn authorized_client_roundtrips() {
@@ -1073,7 +1073,7 @@ git commit -m "test: end-to-end cloaking and silence suite"
 // fuzz/fuzz_targets/peek_dcid.rs
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-fuzz_target!(|data: &[u8]| { let _ = silentquic::transport::peek_dcid(data); });
+fuzz_target!(|data: &[u8]| { let _ = quietquic::transport::peek_dcid(data); });
 ```
 
 - [ ] **Step 2: Run each fuzzer briefly**
@@ -1081,7 +1081,7 @@ fuzz_target!(|data: &[u8]| { let _ = silentquic::transport::peek_dcid(data); });
 Run: `cargo +nightly fuzz run peek_dcid -- -max_total_time=60`
 Expected: no crashes in 60s (CI can run a short budget; document longer local runs).
 
-- [ ] **Step 3: Write `README.md`** — quickstart, config example, and a prominent **Threat Model** section reproducing the spec's "defeats / does NOT defeat" lists verbatim, including the recommendation to run silentquic as the only service on its host. State the 0BSD license.
+- [ ] **Step 3: Write `README.md`** — quickstart, config example, and a prominent **Threat Model** section reproducing the spec's "defeats / does NOT defeat" lists verbatim, including the recommendation to run quietquic as the only service on its host. State the 0BSD license.
 
 - [ ] **Step 4: Run the full suite**
 

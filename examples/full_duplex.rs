@@ -4,7 +4,7 @@
 //! A real application obtains `stream` from `Connection::open_stream` or
 //! `accept_stream`, then moves each half into independently polled work.
 
-use silentquic::conn::{ConnError, Stream};
+use quietquic::conn::{ConnError, Stream};
 
 #[allow(dead_code)]
 async fn exchange(stream: Stream) -> Result<Vec<u8>, ConnError> {

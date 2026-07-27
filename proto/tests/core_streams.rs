@@ -2,7 +2,7 @@
 //! Non-blocking stream semantics of the sans-IO core, proved with **no sockets,
 //! no runtime, and no threads**.
 //!
-//! The unit under test is [`silentquic_proto::conn::ConnState`] — the per-stream
+//! The unit under test is [`quietquic_proto::conn::ConnState`] — the per-stream
 //! plumbing that replaces `src/conn.rs`'s command-channel layer. The load-bearing
 //! property is that *nothing here can park*: a read with no data buffered must
 //! report [`ReadOutcome::Blocked`] and return, because the core has no way to
@@ -13,7 +13,7 @@
 //!
 //! `ConnState` is transport-agnostic: it wraps a `quinn_proto::Connection` and
 //! knows nothing about selectors, PSKs, or the pre-filter. The cloaking layer is
-//! covered by `core_silence.rs` against the real [`silentquic_proto::endpoint::Endpoint`].
+//! covered by `core_silence.rs` against the real [`quietquic_proto::endpoint::Endpoint`].
 //! Building the pair from stock `quinn_proto::Endpoint`s therefore exercises
 //! exactly the code this test is about, and — importantly — does **not** require
 //! `Endpoint::new_client`, which is a later task's deliverable. When the core
@@ -32,9 +32,9 @@ use quinn_proto::{
     EndpointConfig, ServerConfig as TransportServerConfig, StreamId,
 };
 
-use silentquic_proto::conn::ConnState;
-use silentquic_proto::crypto::{reset_key, token_key, SelfSigned};
-use silentquic_proto::outcome::{ReadOutcome, WriteOutcome};
+use quietquic_proto::conn::ConnState;
+use quietquic_proto::crypto::{reset_key, token_key, SelfSigned};
+use quietquic_proto::outcome::{ReadOutcome, WriteOutcome};
 
 /// The TLS name presented in the ClientHello. Verification is skipped (the PSK
 /// authenticates in production; here nothing does), so any stable name works.

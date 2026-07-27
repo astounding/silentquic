@@ -6,7 +6,7 @@
 //! Destination Connection ID (RFC 9001 §5.2). Any observer can reproduce this
 //! derivation and unseal the Initial to read the TLS ClientHello.
 //!
-//! silentquic keeps the identical RFC 9001 key schedule but substitutes the
+//! quietquic keeps the identical RFC 9001 key schedule but substitutes the
 //! **PSK** for the published salt in the initial `HKDF-Extract`:
 //!
 //! ```text
@@ -133,7 +133,7 @@ pub fn initial_keys_from_psk(psk: &[u8; 32], dcid: &[u8], side: Side, version: u
     // version-independent (the labels are the same across QUIC v1); `version`
     // is accepted for signature symmetry with quinn-proto's hooks and asserted
     // in debug builds.
-    debug_assert_eq!(version, 0x0000_0001, "silentquic only speaks QUIC v1");
+    debug_assert_eq!(version, 0x0000_0001, "quietquic only speaks QUIC v1");
 
     // initial_secret = HKDF-Extract(salt = psk, ikm = dcid)
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, psk);
@@ -317,7 +317,7 @@ impl HeaderKey for InitialHeaderKey {
 //     DCID, which the client sets to `build_dcid(psk, nonce, freshness)`.
 // ---------------------------------------------------------------------------
 
-/// QUIC v1 wire version. silentquic only ever produces standard QUIC v1.
+/// QUIC v1 wire version. quietquic only ever produces standard QUIC v1.
 const QUIC_V1: u32 = 0x0000_0001;
 
 /// Server-side crypto config that re-keys the Initial packet from a PSK.
@@ -489,7 +489,7 @@ mod tests {
         // Fixed header + plaintext, sealed at a fixed packet number. `encrypt`
         // seals in place: buf = header ‖ plaintext ‖ (space for TAG_LEN tag).
         const HEADER: &[u8] = &[0xc3, 0x00, 0x00, 0x00, 0x01];
-        const PLAINTEXT: &[u8] = b"silentquic-kat";
+        const PLAINTEXT: &[u8] = b"quietquic-kat";
         let packet_number: u64 = 0;
 
         let mut buf = Vec::new();
@@ -507,9 +507,9 @@ mod tests {
             HEADER,
             "header is AAD, must be unchanged"
         );
-        const EXPECTED_CIPHERTEXT_AND_TAG: [u8; 30] = [
-            198, 61, 185, 123, 150, 238, 166, 92, 206, 201, 222, 182, 234, 1, 23, 173, 206, 213,
-            38, 157, 83, 65, 52, 141, 167, 192, 156, 193, 3, 183,
+        const EXPECTED_CIPHERTEXT_AND_TAG: [u8; 29] = [
+            196, 33, 188, 123, 140, 235, 162, 64, 196, 135, 152, 188, 255, 109, 135, 174, 169, 222,
+            23, 234, 81, 239, 171, 175, 154, 127, 178, 17, 180,
         ];
         assert_eq!(&buf[HEADER.len()..], &EXPECTED_CIPHERTEXT_AND_TAG);
     }

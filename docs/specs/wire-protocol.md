@@ -1,4 +1,4 @@
-# SilentQUIC wire protocol
+# QuietQUIC wire protocol
 
 Status: normative for the `0.1.x` experimental protocol. Multi-byte integer
 encoding and domain-separation inputs are locked by known-answer tests.

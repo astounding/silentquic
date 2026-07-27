@@ -18,13 +18,13 @@
 //!
 //! # Why the *parking* lives here and not in the core
 //!
-//! `silentquic_proto` is sans-IO: it cannot wait for anything, so its
+//! `quietquic_proto` is sans-IO: it cannot wait for anything, so its
 //! `ConnState::stream_read` answers `Read(n)` / `Blocked` / `Finished` right
 //! now and never completes later. But this crate's public API promises
 //! `Stream::read_to_end(limit).await` — a call that *does* complete later. The
 //! difference between those two shapes is exactly `Parked`: the map of handle
 //! operations that have been offered to the core, come back `Blocked`, and are
-//! now waiting for the [`silentquic_proto::outcome::Event`] that says "try
+//! now waiting for the [`quietquic_proto::outcome::Event`] that says "try
 //! again". The driver owns one `Parked` per live connection and services it
 //! from its event dispatch; the core stays free of channels and runtimes.
 //!
@@ -43,18 +43,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use quietquic_proto::conn::ConnState as CoreConn;
+use quietquic_proto::outcome::{ConnectionHandle, ReadOutcome, WriteOutcome};
 use quinn_proto::StreamId;
-use silentquic_proto::conn::ConnState as CoreConn;
-use silentquic_proto::outcome::{ConnectionHandle, ReadOutcome, WriteOutcome};
 use tokio::sync::{mpsc, oneshot};
 
 /// Errors surfaced by [`Connection`] and [`Stream`] operations.
 ///
-/// The enum itself lives in the sans-IO core (`silentquic_proto::conn`) so both
+/// The enum itself lives in the sans-IO core (`quietquic_proto::conn`) so both
 /// layers report failures in the same vocabulary — a hand-rolled embedder and a
 /// tokio application see one error type, not two that must be translated. It is
-/// re-exported here so `silentquic::conn::ConnError` keeps resolving.
-pub use silentquic_proto::conn::ConnError;
+/// re-exported here so `quietquic::conn::ConnError` keeps resolving.
+pub use quietquic_proto::conn::ConnError;
 
 /// A command paired with the connection it targets. The driver owns one
 /// `mpsc::Receiver<Tagged>` across all its connections and routes each command

@@ -2,8 +2,8 @@
 //! Crate configuration: TOML-loaded server/client settings.
 //!
 //! The configuration **types** live in the sans-IO core
-//! (`silentquic_proto::config`) and are re-exported here, so
-//! `silentquic::config::ServerSecrets` and friends resolve unchanged. What
+//! (`quietquic_proto::config`) and are re-exported here, so
+//! `quietquic::config::ServerSecrets` and friends resolve unchanged. What
 //! stays here is the part that touches the filesystem: the `SecretSource` seam
 //! and its v1 implementation, `FileSource`.
 
@@ -11,9 +11,7 @@ use std::path::PathBuf;
 
 // Re-exported so this module's public surface is unchanged; the core owns the
 // types because they are pure parsing with no I/O.
-pub use silentquic_proto::config::{
-    ClientConfigFile, ClientEntry, ConfigError, Psk, ServerSecrets,
-};
+pub use quietquic_proto::config::{ClientConfigFile, ClientEntry, ConfigError, Psk, ServerSecrets};
 
 /// A source of server secrets. v1 ships only `FileSource`; this trait is the
 /// seam for a future optional OS-keyring source.

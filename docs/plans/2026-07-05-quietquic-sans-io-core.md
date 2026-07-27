@@ -1,33 +1,33 @@
-# silentquic sans-IO core — Implementation Plan
+# quietquic sans-IO core — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extract silentquic's protocol logic into a new no-tokio `silentquic-proto` crate that a caller can drive from their own event loop, while the `silentquic` crate's public API stays byte-for-byte unchanged.
+**Goal:** Extract quietquic's protocol logic into a new no-tokio `quietquic-proto` crate that a caller can drive from their own event loop, while the `quietquic` crate's public API stays byte-for-byte unchanged.
 
-**Architecture:** The repository root remains the `silentquic` package and additionally becomes the workspace root; a new member `proto/` holds `silentquic-proto`. All protocol state (quinn-proto driving, cloaking pre-filter, PSK `Initial` re-keying, rate limiter, per-stream buffers, CID bookkeeping) moves into the core, which never performs I/O, never spawns, and never blocks. The tokio driver in `silentquic` becomes a thin loop that feeds datagrams and timer ticks in, and pumps transmits and events out.
+**Architecture:** The repository root remains the `quietquic` package and additionally becomes the workspace root; a new member `proto/` holds `quietquic-proto`. All protocol state (quinn-proto driving, cloaking pre-filter, PSK `Initial` re-keying, rate limiter, per-stream buffers, CID bookkeeping) moves into the core, which never performs I/O, never spawns, and never blocks. The tokio driver in `quietquic` becomes a thin loop that feeds datagrams and timer ticks in, and pumps transmits and events out.
 
-**Tech Stack:** Rust, `quinn-proto` 0.11 (already sans-IO), `aws-lc-rs`, `rustls`; `tokio` only in the `silentquic` crate.
+**Tech Stack:** Rust, `quinn-proto` 0.11 (already sans-IO), `aws-lc-rs`, `rustls`; `tokio` only in the `quietquic` crate.
 
 ## Global Constraints
 
 - **License:** 0BSD. Every new source file starts with `// SPDX-License-Identifier: 0BSD`.
-- **`silentquic-proto` MUST have no tokio in its dependency tree.** Verified by `cargo tree -p silentquic-proto | grep -i tokio` returning nothing.
-- **`silentquic`'s public API is UNCHANGED.** Every existing test must pass **unmodified**: `tests/cloaking.rs`, `tests/spike_silence.rs`, `tests/server_prefilter.rs`, `tests/client_server_roundtrip.rs`, `tests/connection_lifecycle.rs`, the crate's unit tests, and the Ruby gem's 62 RSpec examples. **A test that must be edited is a signal the extraction leaked — stop and report it.**
+- **`quietquic-proto` MUST have no tokio in its dependency tree.** Verified by `cargo tree -p quietquic-proto | grep -i tokio` returning nothing.
+- **`quietquic`'s public API is UNCHANGED.** Every existing test must pass **unmodified**: `tests/cloaking.rs`, `tests/spike_silence.rs`, `tests/server_prefilter.rs`, `tests/client_server_roundtrip.rs`, `tests/connection_lifecycle.rs`, the crate's unit tests, and the Ruby gem's 62 RSpec examples. **A test that must be edited is a signal the extraction leaked — stop and report it.**
 - **No new error taxonomy.** The core reuses the existing `ConnError`. Read/write outcomes are `ReadOutcome { Read(usize), Blocked, Finished }` and `WriteOutcome { Wrote(usize), Blocked }`. The quinn-parity `ReadError`/`WriteError`/`ReadToEndError` types are sub-project 2 and MUST NOT appear here.
 - **No public `read_to_end` in the core.** It is a convenience the tokio layer composes over the core's incremental read.
-- **`FileSource` stays in `silentquic`** — it touches the filesystem, and the core performs no I/O of any kind. Config *types* and their string-parsing move to the core.
+- **`FileSource` stays in `quietquic`** — it touches the filesystem, and the core performs no I/O of any kind. Config *types* and their string-parsing move to the core.
 - **The silence invariant is non-negotiable:** an unauthorized datagram must produce no transmit. `handle_datagram` returns `DatagramOutcome::Dropped` and queues nothing.
 - **Platforms:** macOS and FreeBSD both green (FreeBSD via the VM; see `docs/superpowers/STATUS.md` for prereqs).
 - **TDD:** failing test first, watch it fail, minimal implementation, watch it pass, commit.
 
 ### Sequencing note (deviation from the spec, deliberate)
 
-The spec calls the API-shape spike "the first task." It is scheduled here as **Task 6**, after the mechanical module moves, because the spike must exercise the cloaking pre-filter *through the core*, and `silentquic-proto` cannot depend on `silentquic` (circular). Tasks 2–5 are low-risk verbatim moves that make the spike possible. The spike still lands **before** the risky Endpoint extraction (Tasks 7–10), which is what the spec's front-loading is protecting against.
+The spec calls the API-shape spike "the first task." It is scheduled here as **Task 6**, after the mechanical module moves, because the spike must exercise the cloaking pre-filter *through the core*, and `quietquic-proto` cannot depend on `quietquic` (circular). Tasks 2–5 are low-risk verbatim moves that make the spike possible. The spike still lands **before** the risky Endpoint extraction (Tasks 7–10), which is what the spec's front-loading is protecting against.
 
 ## File Structure
 
 ```
-proto/Cargo.toml                 silentquic-proto — no tokio
+proto/Cargo.toml                 quietquic-proto — no tokio
 proto/src/lib.rs                 crate docs + re-exports
 proto/src/selector.rs            moved verbatim from src/
 proto/src/freshness.rs           moved verbatim
@@ -59,17 +59,17 @@ src/conn.rs                      Connection/Stream handles + command channel (un
 - Modify: `Cargo.toml` (add `[workspace]`, add dependency)
 
 **Interfaces:**
-- Produces: an empty `silentquic-proto` crate that compiles, is a workspace member, is depended on by `silentquic`, and has **no tokio** in its tree.
+- Produces: an empty `quietquic-proto` crate that compiles, is a workspace member, is depended on by `quietquic`, and has **no tokio** in its tree.
 
 - [ ] **Step 1: Create `proto/Cargo.toml`**
 
 ```toml
 [package]
-name = "silentquic-proto"
+name = "quietquic-proto"
 version = "0.0.0"
 edition = "2021"
 license = "0BSD"
-description = "Sans-IO core for silentquic: cloaked QUIC protocol state machine with no I/O, no runtime, and no threads."
+description = "Sans-IO core for quietquic: cloaked QUIC protocol state machine with no I/O, no runtime, and no threads."
 
 [dependencies]
 aws-lc-rs = "1"
@@ -92,12 +92,12 @@ There is deliberately **no `tokio`** entry. Do not add one in any later task.
 
 ```rust
 // SPDX-License-Identifier: 0BSD
-//! Sans-IO core for silentquic.
+//! Sans-IO core for quietquic.
 //!
 //! This crate performs no I/O, spawns no tasks, requires no async runtime, and
 //! never blocks. The caller owns the socket and the clock and drives the state
-//! machine directly, which makes silentquic embeddable in a hand-rolled event
-//! loop (see `examples/poll_loop.rs`). The `silentquic` crate is a tokio
+//! machine directly, which makes quietquic embeddable in a hand-rolled event
+//! loop (see `examples/poll_loop.rs`). The `quietquic` crate is a tokio
 //! wrapper over this core.
 ```
 
@@ -113,7 +113,7 @@ members = ["proto"]
 and add to `[dependencies]`:
 
 ```toml
-silentquic-proto = { path = "proto" }
+quietquic-proto = { path = "proto" }
 ```
 
 - [ ] **Step 4: Verify the whole tree still builds and tests pass**
@@ -123,14 +123,14 @@ Expected: builds; all existing tests pass (58 total across the suites).
 
 - [ ] **Step 5: Verify the core has no tokio**
 
-Run: `cargo tree -p silentquic-proto | grep -i tokio`
+Run: `cargo tree -p quietquic-proto | grep -i tokio`
 Expected: **no output** (exit status 1 from grep is correct here).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock proto
-git commit -m "chore: add silentquic-proto workspace member"
+git commit -m "chore: add quietquic-proto workspace member"
 ```
 
 ---
@@ -144,8 +144,8 @@ git commit -m "chore: add silentquic-proto workspace member"
 - Modify: `proto/src/lib.rs`, `src/lib.rs`
 
 **Interfaces:**
-- Produces: `silentquic_proto::{selector, freshness, replay, transport}` with identical items (`build_dcid`, `parse_dcid`, `selector_matches`, `DcidParts`, `DCID_LEN`, `CONTEXT`, `now_minutes`, `is_fresh`, `WINDOW_MINUTES`, `ReplayGuard`, `peek_dcid`).
-- `silentquic` re-exports all of them at the same paths so its public API is unchanged.
+- Produces: `quietquic_proto::{selector, freshness, replay, transport}` with identical items (`build_dcid`, `parse_dcid`, `selector_matches`, `DcidParts`, `DCID_LEN`, `CONTEXT`, `now_minutes`, `is_fresh`, `WINDOW_MINUTES`, `ReplayGuard`, `peek_dcid`).
+- `quietquic` re-exports all of them at the same paths so its public API is unchanged.
 
 - [ ] **Step 1: Move the four files**
 
@@ -153,7 +153,7 @@ git commit -m "chore: add silentquic-proto workspace member"
 git mv src/selector.rs src/freshness.rs src/replay.rs src/transport.rs proto/src/
 ```
 
-Contents are unchanged — including their `#[cfg(test)]` modules, which now run as part of `silentquic-proto`.
+Contents are unchanged — including their `#[cfg(test)]` modules, which now run as part of `quietquic-proto`.
 
 - [ ] **Step 2: Declare them in `proto/src/lib.rs`**
 
@@ -166,17 +166,17 @@ pub mod selector;
 pub mod transport;
 ```
 
-- [ ] **Step 3: Re-export from `silentquic` so its API is unchanged**
+- [ ] **Step 3: Re-export from `quietquic` so its API is unchanged**
 
 In `src/lib.rs`, replace the `pub mod selector; pub mod freshness; pub mod replay; pub mod transport;` declarations with:
 
 ```rust
-pub use silentquic_proto::{freshness, replay, selector, transport};
+pub use quietquic_proto::{freshness, replay, selector, transport};
 ```
 
 - [ ] **Step 4: Fix intra-crate `use` paths**
 
-In `src/server.rs`, `src/client.rs`, and `src/conn.rs`, any `use crate::selector::…` (likewise `freshness`, `replay`, `transport`) becomes `use silentquic_proto::selector::…`. Find them with:
+In `src/server.rs`, `src/client.rs`, and `src/conn.rs`, any `use crate::selector::…` (likewise `freshness`, `replay`, `transport`) becomes `use quietquic_proto::selector::…`. Find them with:
 
 ```bash
 grep -rn "crate::\(selector\|freshness\|replay\|transport\)" src/
@@ -185,13 +185,13 @@ grep -rn "crate::\(selector\|freshness\|replay\|transport\)" src/
 - [ ] **Step 5: Verify — existing tests must pass UNMODIFIED**
 
 Run: `cargo test --all`
-Expected: all pass. The unit tests that lived in these modules now report under `silentquic-proto`. If any *integration* test needs editing, stop — the public API leaked.
+Expected: all pass. The unit tests that lived in these modules now report under `quietquic-proto`. If any *integration* test needs editing, stop — the public API leaked.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add -A
-git commit -m "refactor: move selector/freshness/replay/transport into silentquic-proto"
+git commit -m "refactor: move selector/freshness/replay/transport into quietquic-proto"
 ```
 
 ---
@@ -204,7 +204,7 @@ git commit -m "refactor: move selector/freshness/replay/transport into silentqui
 - Modify: `src/server.rs` (remove the lifted helpers), `proto/src/lib.rs`, `src/lib.rs`
 
 **Interfaces:**
-- Produces: `silentquic_proto::initial_keys::initial_keys_from_psk(psk: &[u8; 32], dcid: &[u8], side: Side, version: u32)` (signature unchanged), plus `silentquic_proto::crypto::{HmacResetKey, reset_key, token_key, random_bytes, RecordingCidGenerator, SelfSigned}`.
+- Produces: `quietquic_proto::initial_keys::initial_keys_from_psk(psk: &[u8; 32], dcid: &[u8], side: Side, version: u32)` (signature unchanged), plus `quietquic_proto::crypto::{HmacResetKey, reset_key, token_key, random_bytes, RecordingCidGenerator, SelfSigned}`.
 
 - [ ] **Step 1: Move `initial_keys.rs`**
 
@@ -232,15 +232,15 @@ pub mod crypto;
 pub mod initial_keys;
 ```
 
-- [ ] **Step 4: Update `silentquic` to use the moved items**
+- [ ] **Step 4: Update `quietquic` to use the moved items**
 
 In `src/lib.rs`, replace `pub mod initial_keys;` with:
 
 ```rust
-pub use silentquic_proto::initial_keys;
+pub use quietquic_proto::initial_keys;
 ```
 
-In `src/server.rs`, delete the moved definitions and add `use silentquic_proto::crypto::{random_bytes, reset_key, token_key, RecordingCidGenerator, SelfSigned};` — keeping only the names it still references. Fix `use crate::initial_keys::…` → `use silentquic_proto::initial_keys::…` across `src/`.
+In `src/server.rs`, delete the moved definitions and add `use quietquic_proto::crypto::{random_bytes, reset_key, token_key, RecordingCidGenerator, SelfSigned};` — keeping only the names it still references. Fix `use crate::initial_keys::…` → `use quietquic_proto::initial_keys::…` across `src/`.
 
 - [ ] **Step 5: Verify**
 
@@ -251,7 +251,7 @@ Expected: all pass unmodified. `src/server.rs` should now be roughly 250 lines s
 
 ```bash
 git add -A
-git commit -m "refactor: move initial_keys and endpoint crypto helpers into silentquic-proto"
+git commit -m "refactor: move initial_keys and endpoint crypto helpers into quietquic-proto"
 ```
 
 ---
@@ -263,12 +263,12 @@ git commit -m "refactor: move initial_keys and endpoint crypto helpers into sile
 - Modify: `src/config.rs`, `proto/src/lib.rs`, `src/lib.rs`
 
 **Interfaces:**
-- Produces: `silentquic_proto::config::{Psk, ClientEntry, ServerSecrets, ClientConfigFile, ConfigError}` — the types and their `serde`/TOML **string** parsing only.
-- `silentquic::config` keeps `FileSource` (which reads the filesystem, including the `chmod 600` permission warning) and re-exports the types, so `silentquic::config::ServerSecrets` still resolves and the Ruby gem is unaffected.
+- Produces: `quietquic_proto::config::{Psk, ClientEntry, ServerSecrets, ClientConfigFile, ConfigError}` — the types and their `serde`/TOML **string** parsing only.
+- `quietquic::config` keeps `FileSource` (which reads the filesystem, including the `chmod 600` permission warning) and re-exports the types, so `quietquic::config::ServerSecrets` still resolves and the Ruby gem is unaffected.
 
 - [ ] **Step 1: Create `proto/src/config.rs`**
 
-Move from `src/config.rs`, verbatim, with the SPDX header and a `//! Configuration types and their parsing. Contains no filesystem access — see `silentquic::config::FileSource` for loading from disk.` doc line:
+Move from `src/config.rs`, verbatim, with the SPDX header and a `//! Configuration types and their parsing. Contains no filesystem access — see `quietquic::config::FileSource` for loading from disk.` doc line:
 
 - `struct Psk` with its `as_bytes`, manual `Debug` (prints `Psk(***)`), manual `Deserialize` (64-hex → 32 bytes), and `Zeroize`/`ZeroizeOnDrop` derives
 - `struct ClientEntry`, `struct ServerSecrets`, `struct ClientConfigFile`
@@ -281,7 +281,7 @@ Its inline `#[cfg(test)]` tests move too, **except** `file_source_loads`, which 
 Leave only the `SecretSource` trait, `FileSource`, its `impl`, and the `file_source_loads` test. Add at the top:
 
 ```rust
-pub use silentquic_proto::config::{ClientConfigFile, ClientEntry, ConfigError, Psk, ServerSecrets};
+pub use quietquic_proto::config::{ClientConfigFile, ClientEntry, ConfigError, Psk, ServerSecrets};
 ```
 
 - [ ] **Step 3: Declare in `proto/src/lib.rs`**
@@ -304,7 +304,7 @@ Expected: 62 examples, 0 failures. The gem calls `FileSource::new(path).load()` 
 
 ```bash
 git add -A
-git commit -m "refactor: move config types into silentquic-proto, keep FileSource in silentquic"
+git commit -m "refactor: move config types into quietquic-proto, keep FileSource in quietquic"
 ```
 
 ---
@@ -316,7 +316,7 @@ git commit -m "refactor: move config types into silentquic-proto, keep FileSourc
 - Modify: `src/server.rs`, `proto/src/lib.rs`, `src/lib.rs`
 
 **Interfaces:**
-- Produces: `silentquic_proto::ratelimit::{TokenBucket, RateLimiter}` where `RateLimiter::check(&mut self, src: IpAddr, now: Instant) -> bool` already takes `now`. Confirm no internal `Instant::now()` call remains — the core must never read the clock itself.
+- Produces: `quietquic_proto::ratelimit::{TokenBucket, RateLimiter}` where `RateLimiter::check(&mut self, src: IpAddr, now: Instant) -> bool` already takes `now`. Confirm no internal `Instant::now()` call remains — the core must never read the clock itself.
 
 - [ ] **Step 1: Move the file**
 
@@ -332,8 +332,8 @@ Expected: **no output.** If any is found, thread the caller's `now` through inst
 - [ ] **Step 3: Declare and re-export**
 
 `proto/src/lib.rs`: `pub mod ratelimit;`
-`src/lib.rs`: replace `pub mod ratelimit;` with `pub use silentquic_proto::ratelimit;`
-`src/server.rs`: `use crate::ratelimit::…` → `use silentquic_proto::ratelimit::…`
+`src/lib.rs`: replace `pub mod ratelimit;` with `pub use quietquic_proto::ratelimit;`
+`src/server.rs`: `use crate::ratelimit::…` → `use quietquic_proto::ratelimit::…`
 
 - [ ] **Step 4: Verify**
 
@@ -344,7 +344,7 @@ Expected: all pass unmodified, including the flood test.
 
 ```bash
 git add -A
-git commit -m "refactor: move rate limiter into silentquic-proto"
+git commit -m "refactor: move rate limiter into quietquic-proto"
 ```
 
 ---
@@ -417,9 +417,9 @@ pub enum DatagramOutcome {
 // SPDX-License-Identifier: 0BSD
 //! Spike: prove the core API shape upholds the silence invariant with no sockets.
 
-use silentquic_proto::config::ServerSecrets;
-use silentquic_proto::endpoint::Endpoint;
-use silentquic_proto::outcome::DatagramOutcome;
+use quietquic_proto::config::ServerSecrets;
+use quietquic_proto::endpoint::Endpoint;
+use quietquic_proto::outcome::DatagramOutcome;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -475,8 +475,8 @@ fn stock_quic_shaped_initial_is_dropped_and_queues_no_transmit() {
 
 - [ ] **Step 3: Run it and watch it fail**
 
-Run: `cargo test -p silentquic-proto --test core_silence`
-Expected: FAIL to compile — `silentquic_proto::endpoint` does not exist.
+Run: `cargo test -p quietquic-proto --test core_silence`
+Expected: FAIL to compile — `quietquic_proto::endpoint` does not exist.
 
 - [ ] **Step 4: Build the minimal Endpoint**
 
@@ -488,7 +488,7 @@ Declare in `proto/src/lib.rs`: `pub mod endpoint; pub mod outcome;`
 
 - [ ] **Step 5: Run and watch it pass**
 
-Run: `cargo test -p silentquic-proto --test core_silence`
+Run: `cargo test -p quietquic-proto --test core_silence`
 Expected: 2 passed.
 
 - [ ] **Step 6: Record the decision note**
@@ -514,7 +514,7 @@ git commit -m "spike(proto): prove core Endpoint API shape and silence with no s
 - Modify: `proto/src/lib.rs`
 
 **Interfaces:**
-- Produces: `silentquic_proto::conn::ConnState` owning one `quinn_proto::Connection` plus its per-stream buffers, with **non-blocking** stream operations:
+- Produces: `quietquic_proto::conn::ConnState` owning one `quinn_proto::Connection` plus its per-stream buffers, with **non-blocking** stream operations:
 
 ```rust
 impl ConnState {
@@ -529,22 +529,22 @@ impl ConnState {
 }
 ```
 
-- Consumes: `ReadOutcome`/`WriteOutcome` from Task 6, `ConnError` (re-exported from `silentquic_proto`).
+- Consumes: `ReadOutcome`/`WriteOutcome` from Task 6, `ConnError` (re-exported from `quietquic_proto`).
 
-**Note:** `ConnError` currently lives in `src/conn.rs`. Move the enum itself into `proto/src/conn.rs` and re-export it from `silentquic::conn` so `silentquic::conn::ConnError` still resolves.
+**Note:** `ConnError` currently lives in `src/conn.rs`. Move the enum itself into `proto/src/conn.rs` and re-export it from `quietquic::conn` so `quietquic::conn::ConnError` still resolves.
 
 - [ ] **Step 1: Write the failing test** (append to `proto/tests/core_silence.rs` or a new `proto/tests/core_streams.rs`)
 
 ```rust
 // proto/tests/core_streams.rs
 // SPDX-License-Identifier: 0BSD
-use silentquic_proto::outcome::ReadOutcome;
+use quietquic_proto::outcome::ReadOutcome;
 
 #[test]
 fn read_on_an_idle_stream_reports_blocked_not_an_error() {
     // Build a connected pair in memory (helper from core_silence), open a bi
     // stream on side A, and read on side B before any data is sent.
-    let (mut a, mut b) = silentquic_proto::testing::connected_pair();
+    let (mut a, mut b) = quietquic_proto::testing::connected_pair();
     let id = a.open_bi().expect("open_bi");
     a.stream_write(id, b"x").expect("write");
     // Drive datagrams A -> B so B learns about the stream, but read *before*
@@ -561,7 +561,7 @@ Add a `pub mod testing` to the core (gated behind `#[cfg(any(test, feature = "te
 
 - [ ] **Step 2: Run and watch it fail**
 
-Run: `cargo test -p silentquic-proto --test core_streams`
+Run: `cargo test -p quietquic-proto --test core_streams`
 Expected: FAIL — `conn` / `testing` do not exist.
 
 - [ ] **Step 3: Implement `proto/src/conn.rs`**
@@ -570,7 +570,7 @@ Port the stream servicing from `src/conn.rs`'s `ConnState` — `start_write`, `r
 
 - [ ] **Step 4: Run and watch it pass**
 
-Run: `cargo test -p silentquic-proto --test core_streams`
+Run: `cargo test -p quietquic-proto --test core_streams`
 Expected: PASS.
 
 - [ ] **Step 5: Verify nothing regressed; commit**
@@ -617,11 +617,11 @@ pub enum Event {
 ```rust
 #[test]
 fn in_memory_pair_completes_handshake_and_echoes_a_stream() {
-    let (mut client, mut server) = silentquic_proto::testing::connected_pair();
+    let (mut client, mut server) = quietquic_proto::testing::connected_pair();
     let id = client.open_bi().expect("open_bi");
     client.stream_write(id, b"ping").expect("write");
     client.stream_finish(id).expect("finish");
-    let got = silentquic_proto::testing::pump_until_read(&mut client, &mut server, id);
+    let got = quietquic_proto::testing::pump_until_read(&mut client, &mut server, id);
     assert_eq!(&got, b"ping");
 }
 ```
@@ -630,7 +630,7 @@ fn in_memory_pair_completes_handshake_and_echoes_a_stream() {
 
 - [ ] **Step 2: Run and watch it fail**
 
-Run: `cargo test -p silentquic-proto --test core_streams`
+Run: `cargo test -p quietquic-proto --test core_streams`
 Expected: FAIL — `new_client` / `poll_event` missing.
 
 - [ ] **Step 3: Implement**
@@ -641,7 +641,7 @@ Port from `src/server.rs`: `admit`, the connection map, `drain_pending_cids`, `p
 
 - [ ] **Step 4: Run and watch it pass**
 
-Run: `cargo test -p silentquic-proto --test core_streams`
+Run: `cargo test -p quietquic-proto --test core_streams`
 Expected: PASS.
 
 - [ ] **Step 5: Verify and commit**
@@ -661,7 +661,7 @@ git commit -m "feat(proto): complete Endpoint with events, timers, and client co
 - Modify: `src/server.rs`, `src/conn.rs`
 
 **Interfaces:**
-- Consumes: the full `silentquic_proto::endpoint::Endpoint` API.
+- Consumes: the full `quietquic_proto::endpoint::Endpoint` API.
 - Produces: **no public API change.** `Server::bind`, `Server::local_addr`, `Server::accept`, `Connection`, and `Stream` keep their exact current signatures and behavior.
 
 - [ ] **Step 1: Rewrite `Driver` as a thin pump**
@@ -692,7 +692,7 @@ Expected: all pass, clippy clean.
 
 ```bash
 git add -A
-git commit -m "refactor: silentquic server driver becomes a thin pump over the core"
+git commit -m "refactor: quietquic server driver becomes a thin pump over the core"
 ```
 
 ---
@@ -724,7 +724,7 @@ Expected: 62 RSpec examples pass; the gem's Ruby API is untouched.
 
 ```bash
 git add -A
-git commit -m "refactor: silentquic client driver becomes a thin pump over the core"
+git commit -m "refactor: quietquic client driver becomes a thin pump over the core"
 ```
 
 ---
@@ -743,7 +743,7 @@ git commit -m "refactor: silentquic client driver becomes a thin pump over the c
 
 ```rust
 // SPDX-License-Identifier: 0BSD
-//! Reference: driving silentquic from a hand-rolled, zero-timeout event loop.
+//! Reference: driving quietquic from a hand-rolled, zero-timeout event loop.
 //!
 //! This is the shape a classic Unix reactor uses — `select()`/`poll()` with a
 //! zero timeout, servicing whatever is ready and then getting on with other
@@ -776,7 +776,7 @@ The body: build a server `Endpoint`, a non-blocking `std::net::UdpSocket`, then 
 
 - [ ] **Step 2: Verify the example compiles and runs**
 
-Run: `cargo run -p silentquic-proto --example poll_loop`
+Run: `cargo run -p quietquic-proto --example poll_loop`
 Expected: builds and exits 0.
 
 - [ ] **Step 3: Complete the silence matrix in the core tests**
@@ -785,7 +785,7 @@ Extend `proto/tests/core_silence.rs` with the remaining cases, each asserting `D
 
 - [ ] **Step 4: Verify**
 
-Run: `cargo test -p silentquic-proto`
+Run: `cargo test -p quietquic-proto`
 Expected: all core tests pass, including the full silence matrix.
 
 - [ ] **Step 5: Commit**
@@ -800,13 +800,13 @@ git commit -m "docs(proto): reference zero-timeout poll loop; complete core sile
 ### Task 12: Ruby gem packaging — vendor the core crate
 
 **Files:**
-- Modify: `bindings/ruby/Rakefile`, `bindings/ruby/ext/silentquic/extconf.rb`, `bindings/ruby/silentquic.gemspec`, `bindings/ruby/ext/silentquic/Cargo.toml`
+- Modify: `bindings/ruby/Rakefile`, `bindings/ruby/ext/quietquic/extconf.rb`, `bindings/ruby/quietquic.gemspec`, `bindings/ruby/ext/quietquic/Cargo.toml`
 
 **Interfaces:** none new. The gem's Ruby API is unchanged.
 
 - [ ] **Step 1: Extend `vendor_core` to vendor both crates**
 
-The `vendor_core` rake task currently copies the root crate's `src/`, `Cargo.toml`, `Cargo.lock`, and `LICENSE` into `ext/silentquic/vendor/silentquic-core/`. It must now also copy `proto/` and preserve the workspace relationship so the vendored root crate's `silentquic-proto = { path = "proto" }` still resolves inside the gem. Apply the same `rm_rf`-then-copy discipline already used.
+The `vendor_core` rake task currently copies the root crate's `src/`, `Cargo.toml`, `Cargo.lock`, and `LICENSE` into `ext/quietquic/vendor/quietquic-core/`. It must now also copy `proto/` and preserve the workspace relationship so the vendored root crate's `quietquic-proto = { path = "proto" }` still resolves inside the gem. Apply the same `rm_rf`-then-copy discipline already used.
 
 - [ ] **Step 2: Verify the in-repo dev flow still works**
 
@@ -817,8 +817,8 @@ Expected: 62 examples pass.
 
 ```bash
 cd bindings/ruby
-rake vendor_core && gem build silentquic.gemspec
-gem unpack silentquic-*.gem --target /tmp/sqcheck3
+rake vendor_core && gem build quietquic.gemspec
+gem unpack quietquic-*.gem --target /tmp/sqcheck3
 ```
 
 Expected: unpack succeeds with **no `Gem::Package::PathError`**. Confirm `/tmp/sqcheck3` contains both the vendored root crate and its `proto/` subdirectory. Clean up the built gem and `/tmp/sqcheck3` afterwards.
@@ -827,7 +827,7 @@ Expected: unpack succeeds with **no `Gem::Package::PathError`**. Confirm `/tmp/s
 
 ```bash
 git add -A
-git commit -m "build(ruby): vendor silentquic-proto into the gem"
+git commit -m "build(ruby): vendor quietquic-proto into the gem"
 ```
 
 ---
@@ -848,11 +848,11 @@ Expected: all pass. If a test uses `#[tokio::test(flavor = "multi_thread")]` it 
 
 - [ ] **Step 3: Add the example to CI**
 
-In `.github/workflows/ci.yml`, add `cargo run -p silentquic-proto --example poll_loop` to the Rust job so the reference loop cannot rot, and ensure `cargo test --all` covers the workspace.
+In `.github/workflows/ci.yml`, add `cargo run -p quietquic-proto --example poll_loop` to the Rust job so the reference loop cannot rot, and ensure `cargo test --all` covers the workspace.
 
 - [ ] **Step 4: Update the docs**
 
-In `README.md`, add a short "Architecture" section: `silentquic-proto` is the sans-IO core (no I/O, no runtime, no threads — drive it from your own event loop, see `proto/examples/poll_loop.rs`), and `silentquic` is the tokio wrapper. In `docs/superpowers/STATUS.md`, move sub-project **A1** from "📐 Spec approved, not implemented" to "✅ Done", and note that the core is embeddable in a hand-rolled loop.
+In `README.md`, add a short "Architecture" section: `quietquic-proto` is the sans-IO core (no I/O, no runtime, no threads — drive it from your own event loop, see `proto/examples/poll_loop.rs`), and `quietquic` is the tokio wrapper. In `docs/superpowers/STATUS.md`, move sub-project **A1** from "📐 Spec approved, not implemented" to "✅ Done", and note that the core is embeddable in a hand-rolled loop.
 
 - [ ] **Step 5: Full cross-platform verification**
 

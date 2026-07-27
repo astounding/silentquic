@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: 0BSD
 //! Blinded DCID selector: embeds per-client key selection into the QUIC DCID.
 
-pub const CONTEXT: &[u8] = b"silentquic/v1/selector";
+pub const CONTEXT: &[u8] = b"quietquic/v1/selector";
 pub const DCID_LEN: usize = 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -114,7 +114,7 @@ mod tests {
         let psk = [7u8; 32];
         let nonce = [1u8; 8];
         let freshness: u32 = 100;
-        const EXPECTED: [u8; 8] = [68, 97, 187, 227, 192, 229, 195, 215];
+        const EXPECTED: [u8; 8] = [163, 4, 131, 100, 27, 153, 231, 52];
         assert_eq!(compute_selector(&psk, &nonce, freshness), EXPECTED);
     }
 }

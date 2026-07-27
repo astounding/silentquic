@@ -5,7 +5,7 @@ Semantic Versioning while its wire protocol and Rust API remain experimental.
 
 ## 0.1.0-alpha.1 — 2026-07-27
 
-- Split the Sans-I/O protocol core (`silentquic-proto`) from the Tokio wrapper.
+- Split the Sans-I/O protocol core (`quietquic-proto`) from the Tokio wrapper.
 - Enforce silent rejection before allocating QUIC connection state.
 - Add freshness, replay protection, bounded global/per-source rate limiting,
   known-answer vectors, fuzz targets, and cross-platform CI.

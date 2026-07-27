@@ -1,12 +1,12 @@
 # sans-IO core — spike decision note
 
 **Date:** 2026-07-05
-**Spike task:** Task 6 of `plans/2026-07-05-silentquic-sans-io-core.md`
+**Spike task:** Task 6 of `plans/2026-07-05-quietquic-sans-io-core.md`
 **Outcome:** API shape confirmed; proceed with Tasks 7–10.
 
 ## What the spike proved
 
-The cloaking pre-filter runs entirely inside `silentquic-proto`, with the
+The cloaking pre-filter runs entirely inside `quietquic-proto`, with the
 silence invariant expressed structurally. `proto/tests/core_silence.rs` drives a
 real server endpoint with **no sockets, no runtime, and no threads**, and for
 each unauthorized datagram asserts both that the outcome is
@@ -50,7 +50,7 @@ pub enum Event { Connected, StreamOpened, StreamReadable, StreamWritable, Connec
    of one allocation per datagram. Revisit only if profiling shows it matters.
 
 2. **`Transmit` is a core-local type, not `quinn_proto::Transmit`.** quinn-proto's
-   carries `ecn`, `segment_size`, and `src_ip`, none of which silentquic sets
+   carries `ecn`, `segment_size`, and `src_ip`, none of which quietquic sets
    today. Re-exporting it would expose fields the core does not honour.
 
 3. **`LOCAL_CID_LEN` is now public in the core.** It has to be, because

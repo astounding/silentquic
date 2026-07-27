@@ -10,5 +10,5 @@ use libfuzzer_sys::fuzz_target;
 // invariant under fuzzing: never panic, never over-read past `datagram`'s
 // bounds, never allocate on reject, always return in bounded time.
 fuzz_target!(|data: &[u8]| {
-    let _ = silentquic::transport::peek_dcid(data);
+    let _ = quietquic::transport::peek_dcid(data);
 });

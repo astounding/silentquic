@@ -13,8 +13,8 @@
    cargo test --workspace --doc
    cargo clippy --workspace --all-targets --all-features -- -D warnings
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-   cargo package -p silentquic-proto
-   cargo package -p silentquic
+   cargo package -p quietquic-proto
+   cargo package -p quietquic
    cargo deny check
    ```
 
@@ -23,6 +23,6 @@
 7. Install both `.crate` archives into fresh temporary consumers.
 8. Run the polling example and a two-host UDP round trip on supported systems.
 9. Tag the exact tested commit.
-10. Publish `silentquic-proto` first; after crates.io indexes it, publish
-    `silentquic`.
+10. Publish `quietquic-proto` first; after crates.io indexes it, publish
+    `quietquic`.
 11. Confirm both docs.rs builds and all package links.

@@ -28,7 +28,7 @@ pub enum DatagramOutcome {
     ///
     /// # This is NOT the silence invariant
     ///
-    /// The invariant that makes a silentquic server invisible is stated in terms
+    /// The invariant that makes a quietquic server invisible is stated in terms
     /// of the pre-filter, not of this variant:
     ///
     /// > **A datagram that fails the cloaking pre-filter queues nothing to
@@ -109,7 +109,7 @@ pub enum Event {
 /// A generation-safe identifier for a connection owned by an [`Endpoint`].
 ///
 /// Quinn's internal handle is a reusable slab index. This wrapper pairs that
-/// index with a monotonically increasing generation assigned by silentquic, so
+/// index with a monotonically increasing generation assigned by quietquic, so
 /// a handle retained after `ConnectionLost` can never name a later connection.
 ///
 /// [`Endpoint`]: crate::endpoint::Endpoint

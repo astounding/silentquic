@@ -28,11 +28,11 @@
 use std::time::Duration;
 
 use aws_lc_rs::rand::SecureRandom;
-use silentquic::client::Client;
-use silentquic::config::{ClientConfigFile, ServerSecrets};
-use silentquic::freshness::now_minutes;
-use silentquic::selector::{build_dcid, DCID_LEN};
-use silentquic::server::Server;
+use quietquic::client::Client;
+use quietquic::config::{ClientConfigFile, ServerSecrets};
+use quietquic::freshness::now_minutes;
+use quietquic::selector::{build_dcid, DCID_LEN};
+use quietquic::server::Server;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -437,7 +437,7 @@ async fn happy_path_connects_and_echoes() {
         "client is connected to the real server"
     );
 
-    const PAYLOAD: &[u8] = b"silentquic-cloaking-suite-happy-path";
+    const PAYLOAD: &[u8] = b"quietquic-cloaking-suite-happy-path";
     let mut stream = conn
         .open_stream()
         .await

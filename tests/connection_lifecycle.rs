@@ -20,7 +20,7 @@
 //! The fix reaps a connection once `state.conn.is_drained()` (the terminal state
 //! reached by BOTH the remote path — already caught by `progress.lost` — and the
 //! local-close path) in addition to `progress.lost`, in the core's servicing pass
-//! (`silentquic_proto::endpoint::Endpoint`), which both the server (`src/server.rs`)
+//! (`quietquic_proto::endpoint::Endpoint`), which both the server (`src/server.rs`)
 //! and client (`src/client.rs`) drivers now pump.
 //!
 //! This test drives one long-lived `Server` through enough server-side-close
@@ -28,9 +28,9 @@
 //! in `tokio::time::timeout` so a reaping regression fails as a bounded panic
 //! rather than hanging the whole test binary.
 
-use silentquic::client::Client;
-use silentquic::config::{ClientConfigFile, ServerSecrets};
-use silentquic::server::Server;
+use quietquic::client::Client;
+use quietquic::config::{ClientConfigFile, ServerSecrets};
+use quietquic::server::Server;
 use std::time::Duration;
 use tokio::time::timeout;
 

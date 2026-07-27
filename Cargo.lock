@@ -524,6 +524,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "quietquic"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "aws-lc-rs",
+ "bytes",
+ "quietquic-proto",
+ "quinn-proto",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "quietquic-proto"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "aws-lc-rs",
+ "blake3",
+ "bytes",
+ "hex",
+ "quinn-proto",
+ "rcgen",
+ "rustls",
+ "serde",
+ "thiserror",
+ "toml",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "quinn-proto"
 version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -742,40 +776,6 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
-]
-
-[[package]]
-name = "silentquic"
-version = "0.1.0-alpha.1"
-dependencies = [
- "aws-lc-rs",
- "bytes",
- "quinn-proto",
- "rcgen",
- "rustls",
- "silentquic-proto",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "silentquic-proto"
-version = "0.1.0-alpha.1"
-dependencies = [
- "aws-lc-rs",
- "blake3",
- "bytes",
- "hex",
- "quinn-proto",
- "rcgen",
- "rustls",
- "serde",
- "thiserror",
- "toml",
- "tracing",
- "zeroize",
 ]
 
 [[package]]

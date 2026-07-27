@@ -3,7 +3,7 @@
 //!
 //! This module contains **no filesystem access** — parsing happens from strings
 //! only, so the sans-IO core performs no I/O. To load secrets from a file, see
-//! `silentquic::config::FileSource`, which reads the file (and warns about
+//! `quietquic::config::FileSource`, which reads the file (and warns about
 //! group/world-readable permissions) before handing the text here.
 
 use serde::Deserialize;
@@ -83,7 +83,7 @@ pub struct ClientConfigFile {
 /// Errors that can occur while loading or parsing config/secrets.
 ///
 /// The `Io` variant exists for consumers that load config from a file (see
-/// `silentquic::config::FileSource`); this crate itself never performs I/O.
+/// `quietquic::config::FileSource`); this crate itself never performs I/O.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("io: {0}")]

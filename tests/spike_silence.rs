@@ -25,8 +25,8 @@ use quinn_proto::{
     EndpointConfig, Event, ServerConfig, StreamEvent, StreamId,
 };
 
-use silentquic::initial_keys::{PskClientConfig, PskServerConfig};
-use silentquic::selector::{build_dcid, parse_dcid, selector_matches, DCID_LEN};
+use quietquic::initial_keys::{PskClientConfig, PskServerConfig};
+use quietquic::selector::{build_dcid, parse_dcid, selector_matches, DCID_LEN};
 
 fn client_addr() -> SocketAddr {
     SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 44444)
@@ -495,7 +495,7 @@ struct EchoState {
     verified: bool,
 }
 
-const ECHO_MSG: &[u8] = b"silentquic-echo";
+const ECHO_MSG: &[u8] = b"quietquic-echo";
 
 impl EchoState {
     /// Advance the echo one step. Returns true once the round-trip is verified.

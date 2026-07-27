@@ -6,9 +6,9 @@
 //! The second assertion is the one that matters — it is what guarantees an
 //! embedder driving the core by hand cannot reply to an unauthorized peer.
 
-use silentquic_proto::config::ServerSecrets;
-use silentquic_proto::endpoint::Endpoint;
-use silentquic_proto::outcome::DatagramOutcome;
+use quietquic_proto::config::ServerSecrets;
+use quietquic_proto::endpoint::Endpoint;
+use quietquic_proto::outcome::DatagramOutcome;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -83,9 +83,9 @@ fn stock_quic_shaped_initial_is_dropped_and_queues_no_transmit() {
 // reported `Dropped` AND that nothing is queued to send.
 // ---------------------------------------------------------------------------
 
-use silentquic_proto::config::ClientConfigFile;
-use silentquic_proto::freshness::now_minutes;
-use silentquic_proto::selector::build_dcid;
+use quietquic_proto::config::ClientConfigFile;
+use quietquic_proto::freshness::now_minutes;
+use quietquic_proto::selector::build_dcid;
 
 /// A long-header QUIC v1 Initial carrying `dcid`, padded to a plausible size.
 fn initial_with_dcid(dcid: &[u8]) -> Vec<u8> {
@@ -155,7 +155,7 @@ fn replaying_a_genuine_initial_is_dropped() {
     ))
     .expect("parse client config");
     let (mut client, _ch) =
-        silentquic_proto::endpoint::Endpoint::new_client(now, now_minutes(), cfg)
+        quietquic_proto::endpoint::Endpoint::new_client(now, now_minutes(), cfg)
             .expect("client endpoint");
     let initial = client
         .poll_transmit(now)

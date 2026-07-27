@@ -18,8 +18,8 @@
 //! or `bind = "192.168.64.5:0"` to pin only the interface. See
 //! `ClientConfigFile::bind`.
 
-use silentquic::client::Client;
-use silentquic::config::ClientConfigFile;
+use quietquic::client::Client;
+use quietquic::config::ClientConfigFile;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let psk = args.next().ok_or("missing <psk_hex> (64 hex chars)")?;
     let message = args
         .next()
-        .unwrap_or_else(|| "hello from silentquic".to_string());
+        .unwrap_or_else(|| "hello from quietquic".to_string());
     let client_id = args.next().unwrap_or_else(|| "peer".to_string());
     // Optional: pin the local source address/port. Omitted ⇒ ephemeral on any
     // interface, which is the default and the right choice unless a firewall or

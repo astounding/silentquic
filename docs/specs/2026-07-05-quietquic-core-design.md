@@ -1,4 +1,4 @@
-# silentquic sans-IO core — Design Spec
+# quietquic sans-IO core — Design Spec
 
 **Date:** 2026-07-05
 **Status:** Approved design, pre-implementation
@@ -9,7 +9,7 @@
 
 ## 1. Context: why this exists
 
-silentquic today is a tokio library. `Server::bind` and `Client::connect` call
+quietquic today is a tokio library. `Server::bind` and `Client::connect` call
 `tokio::spawn` (see `src/server.rs:114`, `src/client.rs:195`), so the crate
 requires an ambient tokio runtime and owns the UDP socket and the event loop.
 
@@ -34,7 +34,7 @@ Two facts make this an *extraction* rather than an invention:
 
 - **`quinn-proto` is already sans-IO.** It is a pure state machine that performs
   no I/O.
-- **silentquic already runs without sockets in tests.** `tests/spike_silence.rs`
+- **quietquic already runs without sockets in tests.** `tests/spike_silence.rs`
   drives two full endpoints entirely in memory, hand-passing datagrams, and
   completes a real PSK handshake plus a stream echo. The capability exists; it is
   simply not public API.
@@ -47,8 +47,8 @@ driver task are tokio-bound.
 
 | # | Sub-project | Status |
 |---|-------------|--------|
-| 1 | **`silentquic-proto` sans-IO core** (this spec) | designed |
-| 2 | `silentquic` tokio wrapper + quinn-parity split streams | planned |
+| 1 | **`quietquic-proto` sans-IO core** (this spec) | designed |
+| 2 | `quietquic` tokio wrapper + quinn-parity split streams | planned |
 | 3 | `squicusock` — Unix-domain-socket relay daemon | planned |
 | — | *later, optional:* C FFI over the core (unlocks C and Go embedding) | queued |
 | — | *later, optional:* dual-mode Ruby gem (sans-IO polling **and** tokio styles) | queued |
@@ -57,7 +57,7 @@ Sub-project 2 delivers the streaming capability the relay needs: `open_bi`/
 `accept_bi`/`open_uni`/`accept_uni` returning `SendStream`/`RecvStream`,
 incremental `read`, `read_to_end(size_limit)`, `reset`/`stop`, tokio
 `AsyncRead`/`AsyncWrite`, and a quinn-shaped error taxonomy
-(`ReadError`/`WriteError`/`ReadToEndError`) carrying only variants silentquic can
+(`ReadError`/`WriteError`/`ReadToEndError`) carrying only variants quietquic can
 actually produce.
 
 Sub-project 3 (`squicusock`) needs **no protocol of its own**: QUIC natively
@@ -65,7 +65,7 @@ multiplexes independent, individually flow-controlled streams, and a Unix socket
 connection maps onto a QUIC bidirectional stream essentially losslessly —
 ordered reliable bytes, `shutdown(SHUT_WR)` ↔ FIN, abrupt close ↔ `RESET_STREAM`.
 One accepted Unix socket connection becomes one QUIC stream over a single shared
-silentquic connection. No custom multiplexing or framing layer is required.
+quietquic connection. No custom multiplexing or framing layer is required.
 
 ---
 
@@ -74,7 +74,7 @@ silentquic connection. No custom multiplexing or framing layer is required.
 ### Goals
 - Extract a **sans-IO core crate** that performs no I/O, spawns nothing, requires
   no runtime, and never blocks or parks.
-- Preserve **all existing behavior and public API** of the `silentquic` crate, so
+- Preserve **all existing behavior and public API** of the `quietquic` crate, so
   every current test — most importantly the cloaking and silence suites — passes
   unmodified.
 - Make the **silence invariant structural**: an embedder must be unable to reply
@@ -93,14 +93,14 @@ silentquic connection. No custom multiplexing or framing layer is required.
 
 ## 3. Crate structure
 
-The repository root remains the `silentquic` package **and** additionally becomes
-the workspace root. A new member `proto/` holds the **`silentquic-proto`** crate.
-`silentquic` depends on it with `path = "proto"`.
+The repository root remains the `quietquic` package **and** additionally becomes
+the workspace root. A new member `proto/` holds the **`quietquic-proto`** crate.
+`quietquic` depends on it with `path = "proto"`.
 
 ```
-/                     silentquic      (tokio wrapper; workspace root)
-/proto/               silentquic-proto (sans-IO core; no tokio dependency)
-/bindings/ruby/       Ruby gem         (unchanged; sits on silentquic)
+/                     quietquic      (tokio wrapper; workspace root)
+/proto/               quietquic-proto (sans-IO core; no tokio dependency)
+/bindings/ruby/       Ruby gem         (unchanged; sits on quietquic)
 /fuzz/                fuzz targets     (own workspace)
 ```
 
@@ -112,7 +112,7 @@ packaging landed recently and was verified end-to-end through `gem build`,
 working install path for cosmetic gain. A `crates/` layout later is a mechanical
 move.
 
-`silentquic-proto` must have **no tokio dependency at all**, so a C embedder, the
+`quietquic-proto` must have **no tokio dependency at all**, so a C embedder, the
 future FFI, or a polling-mode Ruby binding compiles zero tokio. The crate boundary
 makes layering violations compile errors rather than review comments.
 
@@ -178,7 +178,7 @@ refine these outcomes; they are not introduced here.
 
 A sans-IO core **cannot** offer a blocking `read_to_end` — there is nothing to
 park on — so the core's read primitive is necessarily incremental. This does not
-leak into the public surface: in this sub-project the **`silentquic` crate's
+leak into the public surface: in this sub-project the **`quietquic` crate's
 public API is unchanged**. Its existing `Stream::read_to_end` is reimplemented as
 a loop over the core's incremental read, driven by the tokio driver's existing
 `pending_reads` parking. External behavior is identical, so "every existing test
@@ -189,7 +189,7 @@ reads *publicly* is sub-project 2.
 
 ## 5. What moves, what stays
 
-| Moves into `silentquic-proto` | Stays in `silentquic` |
+| Moves into `quietquic-proto` | Stays in `quietquic` |
 |---|---|
 | `quinn_proto::Endpoint`/`Connection` driving | UDP socket ownership, `tokio::spawn` |
 | **Cloaking pre-filter**: `peek_dcid` → `parse_dcid` → `is_fresh` → `select_psk` → replay guard | the driver's `select!` loop and timers |
@@ -245,10 +245,10 @@ Only after the spike is green does the remaining extraction proceed.
 
 - **Every existing suite passes unmodified.** `cloaking`, `spike_silence`,
   `server_prefilter`, `client_server_roundtrip`, `connection_lifecycle`, the
-  crate's unit tests, and the Ruby gem's 62 examples. Because the `silentquic`
+  crate's unit tests, and the Ruby gem's 62 examples. Because the `quietquic`
   public API is unchanged, no test edits should be required; any test that *must*
   change is a signal the extraction leaked and needs review.
-- **New core-level tests** in `silentquic-proto`: drive an endpoint pair entirely
+- **New core-level tests** in `quietquic-proto`: drive an endpoint pair entirely
   in memory through the public core API — handshake, stream echo, and each silence
   case — with no sockets and no runtime.
 - **Reference example**, compiled and exercised in CI: the zero-timeout poll loop
@@ -265,8 +265,8 @@ Only after the spike is green does the remaining extraction proceed.
 
 ## 9. Success criteria
 
-1. `silentquic-proto` builds with **no tokio in its dependency tree**.
-2. The `silentquic` crate's public API is byte-for-byte source-compatible; every
+1. `quietquic-proto` builds with **no tokio in its dependency tree**.
+2. The `quietquic` crate's public API is byte-for-byte source-compatible; every
    existing test passes **unmodified**, including the Ruby gem's suite.
 3. An endpoint pair completes a PSK handshake and a stream echo driven entirely
    through the core's public API, with no sockets and no runtime.

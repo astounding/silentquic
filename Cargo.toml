@@ -1,24 +1,24 @@
 [package]
-name = "silentquic"
+name = "quietquic"
 version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.88"
 license = "0BSD"
 description = "A PSK-authenticated variant of QUIC that remains silent to unauthorized connection attempts"
-documentation = "https://docs.rs/silentquic"
-repository = "https://github.com/astounding/silentquic"
-homepage = "https://github.com/astounding/silentquic"
+documentation = "https://docs.rs/quietquic"
+repository = "https://github.com/astounding/quietquic"
+homepage = "https://github.com/astounding/quietquic"
 readme = "README.md"
 keywords = ["quic", "transport", "psk", "privacy"]
 categories = ["network-programming", "cryptography"]
 
 # The root package is also the workspace root. `proto/` holds the sans-IO core
-# this crate wraps; see docs/specs/2026-07-05-silentquic-core-design.md
+# this crate wraps; see docs/specs/2026-07-05-quietquic-core-design.md
 [workspace]
 members = ["proto"]
 
 [dependencies]
-silentquic-proto = { version = "=0.1.0-alpha.1", path = "proto" }
+quietquic-proto = { version = "=0.1.0-alpha.1", path = "proto" }
 bytes = "1"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log", "bloom"] }
 thiserror = "2"
