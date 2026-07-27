@@ -21,7 +21,7 @@ logic; it exposes raw authenticated bidirectional byte streams for a caller
 (e.g. a backup tool, a config-push agent, anything that wants a QUIC pipe that
 doesn't advertise itself to the internet) to frame however it likes.
 
-> **Release status:** `0.1.0-alpha.1` is an experimental preview. The protocol
+> **Release status:** `0.1.0-alpha.2` is an experimental preview. The protocol
 > has extensive automated tests but has not yet received an independent
 > cryptographic review. Do not treat it as production-hardened.
 

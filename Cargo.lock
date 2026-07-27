@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "quietquic"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "quietquic-proto"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aws-lc-rs",
  "blake3",

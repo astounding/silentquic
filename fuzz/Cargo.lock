@@ -506,6 +506,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "quietquic"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "bytes",
+ "quietquic-proto",
+ "quinn-proto",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "quietquic-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "quietquic",
+]
+
+[[package]]
+name = "quietquic-proto"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "aws-lc-rs",
+ "blake3",
+ "bytes",
+ "hex",
+ "quinn-proto",
+ "rcgen",
+ "rustls",
+ "serde",
+ "thiserror",
+ "toml",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "quinn-proto"
 version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -698,45 +737,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "quietquic"
-version = "0.1.0-alpha.1"
-dependencies = [
- "bytes",
- "quinn-proto",
- "quietquic-proto",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "quietquic-fuzz"
-version = "0.0.0"
-dependencies = [
- "libfuzzer-sys",
- "quietquic",
-]
-
-[[package]]
-name = "quietquic-proto"
-version = "0.1.0-alpha.1"
-dependencies = [
- "aws-lc-rs",
- "blake3",
- "bytes",
- "hex",
- "quinn-proto",
- "rcgen",
- "rustls",
- "serde",
- "thiserror",
- "toml",
- "tracing",
- "zeroize",
-]
 
 [[package]]
 name = "siphasher"

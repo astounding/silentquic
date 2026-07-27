@@ -1,6 +1,6 @@
 [package]
 name = "quietquic"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 rust-version = "1.88"
 license = "0BSD"
@@ -18,7 +18,7 @@ categories = ["network-programming", "cryptography"]
 members = ["proto"]
 
 [dependencies]
-quietquic-proto = { version = "=0.1.0-alpha.1", path = "proto" }
+quietquic-proto = { version = "=0.1.0-alpha.2", path = "proto" }
 bytes = "1"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log", "bloom"] }
 thiserror = "2"
