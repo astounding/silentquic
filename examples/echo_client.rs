@@ -57,12 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started.elapsed()
     );
 
-    let mut stream = conn.open_stream().await?;
-    stream.write_all(message.as_bytes()).await?;
-    stream.finish().await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(message.as_bytes()).await?;
+    send.finish().await?;
     println!("sent {} bytes", message.len());
 
-    let echo = stream.read_to_end(1024 * 1024).await?;
+    let echo = recv.read_to_end(1024 * 1024).await?;
     println!("echo: {:?}", String::from_utf8_lossy(&echo));
 
     if echo == message.as_bytes() {
@@ -71,6 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("echo did not match what was sent".into());
     }
 
-    conn.close().await;
+    conn.close(0, b"").await?;
     Ok(())
 }

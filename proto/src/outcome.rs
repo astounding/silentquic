@@ -9,6 +9,8 @@
 
 use std::net::SocketAddr;
 
+use quinn_proto::Dir;
+
 /// One datagram the caller should send.
 ///
 /// The core never touches a socket: it hands back bytes and a destination, and
@@ -79,7 +81,82 @@ pub enum WriteOutcome {
 
 /// Something the caller should react to, drained via
 /// [`crate::endpoint::Endpoint::poll_event`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionError {
+    #[error("closed by peer application: code {code}")]
+    ApplicationClosed { code: u64, reason: Vec<u8> },
+    #[error("closed by peer transport: code {code}")]
+    ConnectionClosed {
+        code: u64,
+        /// QUIC frame type associated with the close, when available.
+        ///
+        /// quinn-proto 0.11 carries this internally as `FrameType`, but its raw
+        /// numeric value is not exposed through the public API. quietquic
+        /// therefore leaves this as `None` for now rather than relying on
+        /// private layout, parsing debug output, or taking a patched
+        /// quinn-proto dependency. The field remains for compatibility with a
+        /// future upstream accessor.
+        frame_type: Option<u64>,
+        reason: Vec<u8>,
+    },
+    #[error("transport error: code {code}: {reason}")]
+    TransportError {
+        code: u64,
+        /// QUIC frame type associated with the transport error, when available.
+        ///
+        /// See `ConnectionClosed::frame_type` for why this is currently `None`
+        /// with quinn-proto 0.11.
+        frame_type: Option<u64>,
+        reason: String,
+    },
+    #[error("stateless reset")]
+    Reset,
+    #[error("timed out")]
+    TimedOut,
+    #[error("closed locally")]
+    LocallyClosed,
+    #[error("version mismatch")]
+    VersionMismatch,
+    #[error("connection IDs exhausted")]
+    CidsExhausted,
+}
+
+impl ConnectionError {
+    pub(crate) fn from_quinn(reason: quinn_proto::ConnectionError) -> Self {
+        match reason {
+            quinn_proto::ConnectionError::VersionMismatch => Self::VersionMismatch,
+            quinn_proto::ConnectionError::TransportError(error) => Self::TransportError {
+                code: u64::from(error.code),
+                // quinn-proto 0.11 exposes `FrameType` as a public type, but
+                // not its raw numeric value. Avoid private-layout or string
+                // parsing workarounds; leave room for a future upstream
+                // accessor without committing quietquic to carrying a patch.
+                frame_type: None,
+                reason: error.reason,
+            },
+            quinn_proto::ConnectionError::ConnectionClosed(close) => Self::ConnectionClosed {
+                code: u64::from(close.error_code),
+                // Same `FrameType` limitation as above.
+                frame_type: None,
+                reason: close.reason.to_vec(),
+            },
+            quinn_proto::ConnectionError::ApplicationClosed(close) => Self::ApplicationClosed {
+                code: close.error_code.into_inner(),
+                reason: close.reason.to_vec(),
+            },
+            quinn_proto::ConnectionError::Reset => Self::Reset,
+            quinn_proto::ConnectionError::TimedOut => Self::TimedOut,
+            quinn_proto::ConnectionError::LocallyClosed => Self::LocallyClosed,
+            quinn_proto::ConnectionError::CidsExhausted => Self::CidsExhausted,
+        }
+    }
+}
+
+/// Something the caller should react to, drained via
+/// [`crate::endpoint::Endpoint::poll_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A connection completed its handshake and is ready for streams.
     Connected(ConnectionHandle),
@@ -87,6 +164,7 @@ pub enum Event {
     StreamOpened {
         conn: ConnectionHandle,
         id: quinn_proto::StreamId,
+        dir: Dir,
     },
     /// A stream has data buffered; a previously `Blocked` read may now progress.
     StreamReadable {
@@ -98,13 +176,27 @@ pub enum Event {
         conn: ConnectionHandle,
         id: quinn_proto::StreamId,
     },
+    /// The peer acknowledged this stream's FIN.
+    StreamFinAcked {
+        conn: ConnectionHandle,
+        id: quinn_proto::StreamId,
+    },
+    /// The peer asked us to stop sending on this stream.
+    StreamStopped {
+        conn: ConnectionHandle,
+        id: quinn_proto::StreamId,
+        error_code: u64,
+    },
     /// The connection is gone.
     ///
     ///
     /// The handle becomes permanently stale at this point. Generation checking
     /// guarantees that retaining it cannot address a later connection even if
     /// Quinn reuses its internal slab slot.
-    ConnectionLost { conn: ConnectionHandle },
+    ConnectionLost {
+        conn: ConnectionHandle,
+        reason: ConnectionError,
+    },
 }
 /// A generation-safe identifier for a connection owned by an [`Endpoint`].
 ///

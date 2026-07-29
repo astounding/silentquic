@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: 0BSD
 //! Minimal bounded full-duplex stream pattern.
 //!
-//! A real application obtains `stream` from `Connection::open_stream` or
-//! `accept_stream`, then moves each half into independently polled work.
+//! A real application obtains `(send, recv)` from `Connection::open_bi` or
+//! `accept_bi`, then moves each half into independently polled work.
 
-use quietquic::conn::{ConnError, Stream};
+use quietquic::conn::{ConnError, RecvStream, SendStream};
 
 #[allow(dead_code)]
-async fn exchange(stream: Stream) -> Result<Vec<u8>, ConnError> {
-    let (mut recv, mut send) = stream.split();
-
+async fn exchange(mut send: SendStream, mut recv: RecvStream) -> Result<Vec<u8>, ConnError> {
     let receive = async move {
         let mut response = Vec::new();
         loop {

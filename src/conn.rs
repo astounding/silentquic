@@ -5,8 +5,8 @@
 //! must pump it continuously (poll_transmit → socket, feed inbound datagrams,
 //! service timers, drain app events). Application code cannot hold the
 //! `Connection` directly without stalling that pump. So [`Connection`] and
-//! [`Stream`] here are *lightweight handles*: they send commands to the driver
-//! over a [`tokio::sync::mpsc`] channel and await replies over
+//! [`SendStream`] / [`RecvStream`] here are *lightweight handles*: they send
+//! commands to the driver over a [`tokio::sync::mpsc`] channel and await replies over
 //! [`tokio::sync::oneshot`] channels. The driver applies each command against
 //! the owned `quinn_proto::Connection` inside its event loop and routes stream
 //! events back.
@@ -21,12 +21,12 @@
 //! `quietquic_proto` is sans-IO: it cannot wait for anything, so its
 //! `ConnState::stream_read` answers `Read(n)` / `Blocked` / `Finished` right
 //! now and never completes later. But this crate's public API promises
-//! `Stream::read_to_end(limit).await` — a call that *does* complete later. The
-//! difference between those two shapes is exactly `Parked`: the map of handle
-//! operations that have been offered to the core, come back `Blocked`, and are
-//! now waiting for the [`quietquic_proto::outcome::Event`] that says "try
-//! again". The driver owns one `Parked` per live connection and services it
-//! from its event dispatch; the core stays free of channels and runtimes.
+//! `RecvStream::read_to_end(limit).await` — a call that *does* complete later.
+//! The difference between those two shapes is exactly `Parked`: the map of
+//! handle operations that have been offered to the core, come back `Blocked`,
+//! and are now waiting for the [`quietquic_proto::outcome::Event`] that says
+//! "try again". The driver owns one `Parked` per live connection and services
+//! it from its event dispatch; the core stays free of channels and runtimes.
 //!
 //! # Forward-compat seam ([`Connection::quinn_connection`])
 //!
@@ -43,18 +43,21 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use quietquic_proto::conn::ConnState as CoreConn;
+use bytes::Bytes;
+use quietquic_proto::conn::{ConnState as CoreConn, SendFin};
 use quietquic_proto::outcome::{ConnectionHandle, ReadOutcome, WriteOutcome};
-use quinn_proto::StreamId;
-use tokio::sync::{mpsc, oneshot};
+use quinn_proto::{StreamId, VarInt};
+use tokio::sync::{mpsc, oneshot, watch};
 
-/// Errors surfaced by [`Connection`] and [`Stream`] operations.
+/// Errors surfaced by [`Connection`], [`SendStream`], and [`RecvStream`]
+/// operations.
 ///
 /// The enum itself lives in the sans-IO core (`quietquic_proto::conn`) so both
 /// layers report failures in the same vocabulary — a hand-rolled embedder and a
 /// tokio application see one error type, not two that must be translated. It is
 /// re-exported here so `quietquic::conn::ConnError` keeps resolving.
 pub use quietquic_proto::conn::ConnError;
+pub use quietquic_proto::outcome::ConnectionError;
 
 /// A command paired with the connection it targets. The driver owns one
 /// `mpsc::Receiver<Tagged>` across all its connections and routes each command
@@ -67,7 +70,8 @@ pub(crate) struct Tagged {
 
 /// A [`Cmd`] channel sender pre-bound to one connection's handle, so handles can
 /// enqueue commands without knowing the routing key. Cloned freely across a
-/// connection's [`Connection`] / [`Stream`] / [`QuinnHandle`] handles.
+/// connection's [`Connection`] / [`SendStream`] / [`RecvStream`] /
+/// [`QuinnHandle`] handles.
 #[derive(Clone)]
 pub(crate) struct CmdSender {
     handle: ConnectionHandle,
@@ -87,6 +91,13 @@ impl CmdSender {
             })
             .await
             .map_err(|_| ConnError::Closed)
+    }
+
+    fn try_send(&self, cmd: Cmd) -> Result<(), mpsc::error::TrySendError<Tagged>> {
+        self.tx.try_send(Tagged {
+            handle: self.handle,
+            cmd,
+        })
     }
 }
 
@@ -113,6 +124,25 @@ pub(crate) enum Cmd {
         id: StreamId,
         reply: oneshot::Sender<Result<(), ConnError>>,
     },
+    /// Wait until a previously finished send stream reaches a terminal fact.
+    WaitFinished {
+        id: StreamId,
+        reply: oneshot::Sender<Result<(), ConnError>>,
+    },
+    /// Reset a send stream locally.
+    Reset {
+        id: StreamId,
+        code: VarInt,
+        reply: oneshot::Sender<Result<(), ConnError>>,
+    },
+    /// Stop a receive stream locally.
+    Stop {
+        id: StreamId,
+        code: VarInt,
+        reply: oneshot::Sender<Result<(), ConnError>>,
+    },
+    /// Release the core's send-half finish/stop fact.
+    ReleaseSend { id: StreamId },
     /// Read a recv stream to end-of-stream; reply with all bytes once FIN is
     /// observed (or an error if the stream is reset).
     ReadToEnd {
@@ -130,7 +160,7 @@ pub(crate) enum Cmd {
     /// Close the connection with an application error code, sending a
     /// CONNECTION_CLOSE frame so the peer (and this side's driver) tear down
     /// promptly rather than waiting out the idle timeout.
-    Close,
+    Close { code: VarInt, reason: Vec<u8> },
 }
 
 /// A post-handshake, PSK-authenticated QUIC connection.
@@ -140,11 +170,13 @@ pub(crate) enum Cmd {
 /// a handle onto a connection the driver still owns and pumps; dropping it does
 /// not tear the connection down (the driver keeps running until the peer closes
 /// or the driver's owner is dropped).
+#[derive(Clone)]
 pub struct Connection {
     remote: std::net::SocketAddr,
     handle: ConnectionHandle,
     client_id: Option<String>,
     cmds: CmdSender,
+    closed: watch::Receiver<Option<ConnectionError>>,
 }
 
 impl Connection {
@@ -155,12 +187,14 @@ impl Connection {
         remote: std::net::SocketAddr,
         client_id: Option<String>,
         cmds: CmdSender,
+        closed: watch::Receiver<Option<ConnectionError>>,
     ) -> Self {
         Self {
             remote,
             handle,
             client_id,
             cmds,
+            closed,
         }
     }
 
@@ -184,26 +218,47 @@ impl Connection {
     }
 
     /// Open a new bidirectional stream.
-    pub async fn open_stream(&self) -> Result<Stream, ConnError> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds.send(Cmd::OpenBi(tx)).await?;
         let id = rx.await.map_err(|_| ConnError::Closed)??;
-        Ok(Stream::new(id, self.cmds.clone()))
+        Ok(bi_stream(id, self.cmds.clone()))
     }
 
     /// Await the next bidirectional stream the peer opens.
-    pub async fn accept_stream(&self) -> Result<Stream, ConnError> {
+    pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds.send(Cmd::AcceptBi(tx)).await?;
         let id = rx.await.map_err(|_| ConnError::Closed)??;
-        Ok(Stream::new(id, self.cmds.clone()))
+        Ok(bi_stream(id, self.cmds.clone()))
     }
 
     /// Close the connection, sending a CONNECTION_CLOSE frame so the peer tears
     /// down promptly (rather than waiting out the idle timeout). Best-effort: if
     /// the driver is already gone the connection is effectively closed anyway.
-    pub async fn close(&self) {
-        let _ = self.cmds.send(Cmd::Close).await;
+    pub async fn close(&self, code: u64, reason: &[u8]) -> Result<(), ConnError> {
+        let code = varint(code)?;
+        let _ = self
+            .cmds
+            .send(Cmd::Close {
+                code,
+                reason: reason.to_vec(),
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Wait for the connection to terminate and return the terminal reason.
+    pub async fn closed(&self) -> ConnectionError {
+        let mut closed = self.closed.clone();
+        loop {
+            if let Some(reason) = closed.borrow().clone() {
+                return reason;
+            }
+            if closed.changed().await.is_err() {
+                return ConnectionError::LocallyClosed;
+            }
+        }
     }
 
     /// The forward-compat escape hatch: a minimal, `Clone`able handle onto the
@@ -260,69 +315,56 @@ impl QuinnHandle {
     }
 
     /// Open a new bidirectional stream.
-    pub async fn open_bi(&self) -> Result<Stream, ConnError> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds.send(Cmd::OpenBi(tx)).await?;
         let id = rx.await.map_err(|_| ConnError::Closed)??;
-        Ok(Stream::new(id, self.cmds.clone()))
+        Ok(bi_stream(id, self.cmds.clone()))
     }
 
     /// Await the next peer-initiated bidirectional stream.
-    pub async fn accept_bi(&self) -> Result<Stream, ConnError> {
+    pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds.send(Cmd::AcceptBi(tx)).await?;
         let id = rx.await.map_err(|_| ConnError::Closed)??;
-        Ok(Stream::new(id, self.cmds.clone()))
+        Ok(bi_stream(id, self.cmds.clone()))
+    }
+
+    pub async fn finish(&self, id: StreamId) -> Result<(), ConnError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds.send(Cmd::Finish { id, reply: tx }).await?;
+        rx.await.map_err(|_| ConnError::Closed)?
+    }
+
+    pub async fn wait_finished(&self, id: StreamId) -> Result<(), ConnError> {
+        wait_finished(&self.cmds, id).await
+    }
+
+    pub async fn finish_and_wait(&self, id: StreamId) -> Result<(), ConnError> {
+        self.finish(id).await?;
+        self.wait_finished(id).await
+    }
+
+    pub async fn forget_send(&self, id: StreamId) {
+        let _ = self.cmds.send(Cmd::ReleaseSend { id }).await;
     }
 }
 
-/// A bidirectional QUIC stream handle. Like [`Connection`], it talks to the
-/// driver over the shared command channel; the driver applies each write/finish/
-/// read against the owned `quinn_proto::Connection` and its send/recv streams.
-pub struct Stream {
+/// Receive half of a split bidirectional stream.
+pub struct RecvStream {
     id: StreamId,
     cmds: CmdSender,
 }
 
-impl Stream {
-    pub(crate) fn new(id: StreamId, cmds: CmdSender) -> Self {
-        Self { id, cmds }
-    }
-
-    /// The stream's id.
+impl RecvStream {
     pub fn id(&self) -> StreamId {
         self.id
     }
 
-    /// Write all of `buf` to the stream, waiting out flow-control back-pressure.
-    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), ConnError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmds
-            .send(Cmd::Write {
-                id: self.id,
-                data: buf.to_vec(),
-                reply: tx,
-            })
-            .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
+    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>, ConnError> {
+        read_chunk(&self.cmds, self.id, max).await
     }
 
-    /// Finish (send FIN on) the stream, signalling end-of-data to the peer.
-    pub async fn finish(&mut self) -> Result<(), ConnError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmds
-            .send(Cmd::Finish {
-                id: self.id,
-                reply: tx,
-            })
-            .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
-    }
-
-    /// Read the stream to end-of-stream, up to `limit` bytes.
-    ///
-    /// Returns [`ConnError::ReadLimitExceeded`] instead of allowing an
-    /// authenticated peer to grow memory without bound.
     pub async fn read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds
@@ -335,36 +377,17 @@ impl Stream {
         rx.await.map_err(|_| ConnError::Closed)?
     }
 
-    /// Read up to `max` bytes. Returns an empty vector after clean FIN.
-    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>, ConnError> {
-        read_chunk(&self.cmds, self.id, max).await
-    }
-
-    /// Split this bidirectional stream into independently movable receive and
-    /// send handles so callers can relay both directions concurrently.
-    pub fn split(self) -> (RecvStream, SendStream) {
-        (
-            RecvStream {
+    pub async fn stop(&mut self, code: u64) -> Result<(), ConnError> {
+        let code = varint(code)?;
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Stop {
                 id: self.id,
-                cmds: self.cmds.clone(),
-            },
-            SendStream {
-                id: self.id,
-                cmds: self.cmds,
-            },
-        )
-    }
-}
-
-/// Receive half of a split bidirectional stream.
-pub struct RecvStream {
-    id: StreamId,
-    cmds: CmdSender,
-}
-
-impl RecvStream {
-    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>, ConnError> {
-        read_chunk(&self.cmds, self.id, max).await
+                code,
+                reply: tx,
+            })
+            .await?;
+        rx.await.map_err(|_| ConnError::Closed)?
     }
 }
 
@@ -375,6 +398,10 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    pub fn id(&self) -> StreamId {
+        self.id
+    }
+
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), ConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmds
@@ -397,6 +424,34 @@ impl SendStream {
             .await?;
         rx.await.map_err(|_| ConnError::Closed)?
     }
+
+    pub async fn wait_finished(&mut self) -> Result<(), ConnError> {
+        wait_finished(&self.cmds, self.id).await
+    }
+
+    pub async fn finish_and_wait(&mut self) -> Result<(), ConnError> {
+        self.finish().await?;
+        self.wait_finished().await
+    }
+
+    pub async fn reset(&mut self, code: u64) -> Result<(), ConnError> {
+        let code = varint(code)?;
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Reset {
+                id: self.id,
+                code,
+                reply: tx,
+            })
+            .await?;
+        rx.await.map_err(|_| ConnError::Closed)?
+    }
+}
+
+impl Drop for SendStream {
+    fn drop(&mut self) {
+        let _ = self.cmds.try_send(Cmd::ReleaseSend { id: self.id });
+    }
 }
 
 async fn read_chunk(cmds: &CmdSender, id: StreamId, max: usize) -> Result<Vec<u8>, ConnError> {
@@ -406,6 +461,26 @@ async fn read_chunk(cmds: &CmdSender, id: StreamId, max: usize) -> Result<Vec<u8
     let (tx, rx) = oneshot::channel();
     cmds.send(Cmd::Read { id, max, reply: tx }).await?;
     rx.await.map_err(|_| ConnError::Closed)?
+}
+
+async fn wait_finished(cmds: &CmdSender, id: StreamId) -> Result<(), ConnError> {
+    let (tx, rx) = oneshot::channel();
+    cmds.send(Cmd::WaitFinished { id, reply: tx }).await?;
+    rx.await.map_err(|_| ConnError::Closed)?
+}
+
+fn bi_stream(id: StreamId, cmds: CmdSender) -> (SendStream, RecvStream) {
+    (
+        SendStream {
+            id,
+            cmds: cmds.clone(),
+        },
+        RecvStream { id, cmds },
+    )
+}
+
+fn varint(code: u64) -> Result<VarInt, ConnError> {
+    VarInt::from_u64(code).map_err(|_| ConnError::InvalidErrorCode { code })
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +531,6 @@ struct PendingRead {
 ///
 /// and all three are failed with [`ConnError::Closed`] by [`Parked::fail_all`]
 /// when `Event::ConnectionLost` names this connection.
-#[derive(Default)]
 pub(crate) struct Parked {
     /// Accept requests waiting for a peer-opened bi stream, FIFO.
     pending_accepts: VecDeque<oneshot::Sender<Result<StreamId, ConnError>>>,
@@ -464,9 +538,30 @@ pub(crate) struct Parked {
     blocked_writes: HashMap<StreamId, PendingWrite>,
     /// Reads awaiting end-of-stream, keyed by stream.
     pending_reads: HashMap<StreamId, PendingRead>,
+    /// Waiters awaiting this stream's send-half terminal fact.
+    fin_waiters: HashMap<StreamId, Vec<oneshot::Sender<Result<(), ConnError>>>>,
+    closed: watch::Sender<Option<ConnectionError>>,
 }
 
 impl Parked {
+    pub(crate) fn new(closed: watch::Sender<Option<ConnectionError>>) -> Self {
+        Self {
+            pending_accepts: VecDeque::new(),
+            blocked_writes: HashMap::new(),
+            pending_reads: HashMap::new(),
+            fin_waiters: HashMap::new(),
+            closed,
+        }
+    }
+
+    pub(crate) fn subscribe_closed(&self) -> watch::Receiver<Option<ConnectionError>> {
+        self.closed.subscribe()
+    }
+
+    pub(crate) fn mark_closed(&self, reason: ConnectionError) {
+        let _ = self.closed.send(Some(reason));
+    }
+
     /// Apply one handle-issued command against `core`, answering immediately
     /// where the core can and parking where it cannot.
     ///
@@ -503,6 +598,39 @@ impl Parked {
             Cmd::Finish { id, reply } => {
                 let _ = reply.send(core.stream_finish(id));
             }
+            Cmd::WaitFinished { id, reply } => match core.send_fin(id) {
+                Some(SendFin::Acked) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Some(SendFin::Stopped(code)) => {
+                    let _ = reply.send(Err(ConnError::Stopped { code }));
+                }
+                Some(SendFin::Queued) => self.fin_waiters.entry(id).or_default().push(reply),
+                Some(_) => {
+                    let _ = reply.send(Err(ConnError::ClosedStream));
+                }
+                None => {
+                    let _ = reply.send(Err(ConnError::ClosedStream));
+                }
+            },
+            Cmd::Reset { id, code, reply } => {
+                let result = core.stream_reset(id, code.into_inner());
+                if result.is_ok() {
+                    self.fail_fin_waiters(id, ConnError::ClosedStream);
+                    self.fail_blocked_write(id, ConnError::ClosedStream);
+                }
+                let _ = reply.send(result);
+            }
+            Cmd::Stop { id, code, reply } => {
+                let result = core.stream_stop(id, code.into_inner());
+                if result.is_ok() {
+                    self.fail_pending_read(id, ConnError::ClosedStream);
+                }
+                let _ = reply.send(result);
+            }
+            Cmd::ReleaseSend { id } => {
+                core.forget_send(id);
+            }
             Cmd::ReadToEnd { id, limit, reply } => {
                 let mut pending = PendingRead {
                     buf: Vec::new(),
@@ -525,7 +653,7 @@ impl Parked {
                     self.pending_reads.insert(id, pending);
                 }
             }
-            Cmd::Close => {
+            Cmd::Close { code, reason } => {
                 // The core deliberately exposes no `close`: it is a
                 // connection-level operation with no non-blocking/blocking
                 // distinction, so it goes straight to the owned connection.
@@ -533,8 +661,7 @@ impl Parked {
                 // next `poll_transmit` drain, and the close timer it arms is
                 // what eventually drives the connection to `Drained` — which
                 // the core reaps and reports as `Event::ConnectionLost`.
-                core.conn_mut()
-                    .close(now, quinn_proto::VarInt::from_u32(0), bytes::Bytes::new());
+                core.conn_mut().close(now, code, Bytes::from(reason));
             }
         }
     }
@@ -585,6 +712,21 @@ impl Parked {
         }
     }
 
+    /// Complete a finish waiter when the peer acknowledges the stream's FIN.
+    pub(crate) fn on_fin_acked(&mut self, id: StreamId) {
+        if let Some(waiters) = self.fin_waiters.remove(&id) {
+            for reply in waiters {
+                let _ = reply.send(Ok(()));
+            }
+        }
+    }
+
+    /// Complete waiters and writes when the peer asks us to stop sending.
+    pub(crate) fn on_stopped(&mut self, core: &mut CoreConn, id: StreamId, code: u64) {
+        self.fail_fin_waiters(id, ConnError::Stopped { code });
+        self.on_writable(core, id);
+    }
+
     /// Fail every parked handle operation with [`ConnError::Closed`].
     ///
     /// Called when the connection is lost, so awaiting handles wake with an
@@ -598,6 +740,31 @@ impl Parked {
         }
         for (_, pending) in self.pending_reads.drain() {
             let _ = pending.reply.send(Err(ConnError::Closed));
+        }
+        for (_, waiters) in self.fin_waiters.drain() {
+            for reply in waiters {
+                let _ = reply.send(Err(ConnError::Closed));
+            }
+        }
+    }
+
+    fn fail_fin_waiters(&mut self, id: StreamId, err: ConnError) {
+        if let Some(waiters) = self.fin_waiters.remove(&id) {
+            for reply in waiters {
+                let _ = reply.send(Err(err.clone()));
+            }
+        }
+    }
+
+    fn fail_blocked_write(&mut self, id: StreamId, err: ConnError) {
+        if let Some(pending) = self.blocked_writes.remove(&id) {
+            let _ = pending.reply.send(Err(err));
+        }
+    }
+
+    fn fail_pending_read(&mut self, id: StreamId, err: ConnError) {
+        if let Some(pending) = self.pending_reads.remove(&id) {
+            let _ = pending.reply.send(Err(err));
         }
     }
 
@@ -633,7 +800,7 @@ impl Parked {
     /// This loop **is** `read_to_end`: the core offers only the incremental
     /// `Read`/`Blocked`/`Finished` answer, and accumulating across `Blocked`s
     /// until `Finished` is what turns it back into the crate's one-shot
-    /// `Stream::read_to_end` promise.
+    /// `RecvStream::read_to_end` promise.
     fn pump_read(core: &mut CoreConn, id: StreamId, pending: &mut PendingRead) -> bool {
         loop {
             // Read straight into the tail of the accumulator, so a large
@@ -690,7 +857,7 @@ impl Parked {
                     // this crate's pre-core behaviour (a second `read_to_end`
                     // on a drained stream is an error).
                     if pending.end_limit.is_some() {
-                        core.forget_stream(id);
+                        core.forget_recv(id);
                     }
                     let buf = std::mem::take(&mut pending.buf);
                     let reply = replace_reply_read(&mut pending.reply);

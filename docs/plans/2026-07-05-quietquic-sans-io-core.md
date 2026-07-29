@@ -1,5 +1,11 @@
 # quietquic sans-IO core — Implementation Plan
 
+> **ARCHIVED / SUPERSEDED:** This is a historical implementation plan, not a
+> current work plan. It preserves old public-API assumptions, unchecked task
+> lists, and examples that may no longer match the code. For current usage,
+> prefer the root `README.md`, the current Rust API, and
+> `docs/specs/wire-protocol.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extract quietquic's protocol logic into a new no-tokio `quietquic-proto` crate that a caller can drive from their own event loop, while the `quietquic` crate's public API stays byte-for-byte unchanged.

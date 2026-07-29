@@ -472,7 +472,7 @@ fn locally_closed_connection_reaches_is_drained_without_a_lost_event() {
             Some(at) => pair.client.conn_mut().handle_timeout(at),
             None => break,
         }
-        saw_lost |= pair.client.service_streams().lost;
+        saw_lost |= pair.client.service_streams().lost.is_some();
     }
 
     assert!(

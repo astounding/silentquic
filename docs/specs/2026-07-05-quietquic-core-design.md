@@ -150,40 +150,48 @@ stream_write(&mut self, conn: ConnHandle, id: StreamId, buf: &[u8])
 stream_finish(&mut self, conn: ConnHandle, id: StreamId) -> Result<(), ConnError>
 stream_reset(&mut self, conn: ConnHandle, id: StreamId, code: u64) -> Result<(), ConnError>
 stream_stop(&mut self, conn: ConnHandle, id: StreamId, code: u64) -> Result<(), ConnError>
+send_fin(&self, conn: ConnHandle, id: StreamId) -> Option<SendFin>
+forget_send(&mut self, conn: ConnHandle, id: StreamId)
 
 enum DatagramOutcome { Dropped, Accepted(ConnHandle) }
 enum ReadOutcome  { Read(usize), Blocked, Finished }   // Finished = peer FIN
 enum WriteOutcome { Wrote(usize), Blocked }            // Blocked = flow-control backpressure
+enum SendFin { Queued, Acked, Stopped(u64) }
 enum Event {
     Connected(ConnHandle),
-    StreamOpened { conn: ConnHandle, id: StreamId },
+    StreamOpened { conn: ConnHandle, id: StreamId, dir: Dir },
     StreamReadable { conn: ConnHandle, id: StreamId },
     StreamWritable { conn: ConnHandle, id: StreamId },
-    ConnectionLost { conn: ConnHandle },
+    StreamFinAcked { conn: ConnHandle, id: StreamId },
+    StreamStopped { conn: ConnHandle, id: StreamId, error_code: u64 },
+    ConnectionLost { conn: ConnHandle, reason: ConnectionError },
 }
 ```
 
-Exact signatures are confirmed by the spike (§7); the shape above is binding.
+Exact signatures are confirmed by the implementation. `ConnError` is structured
+and shared by the core and Tokio wrapper; `ConnectionError` is the terminal
+connection fact carried by `ConnectionLost` and by the wrapper's
+`Connection::closed()`. The three-way `ReadOutcome`/`WriteOutcome` enums still
+express the outcomes sans-IO needs (progress, would-block, end-of-stream)
+without turning "nothing available right now" into an error.
 
-**Errors in this sub-project stay as they are.** The core reuses the existing
-`ConnError`, and the three-way `ReadOutcome`/`WriteOutcome` enums express the
-outcomes sans-IO needs (progress, would-block, end-of-stream) *without*
-introducing a new error taxonomy. This deliberately matches the POSIX shape the
-target consumer already reasons in — where "no data right now" is a distinct,
-expected, non-fatal outcome rather than a failure. The quinn-parity
-`ReadError`/`WriteError`/`ReadToEndError` types are sub-project 2's work and will
-refine these outcomes; they are not introduced here.
+`ConnectionError::{ConnectionClosed, TransportError}.frame_type` is intentionally
+`None` under quinn-proto 0.11. Quinn-proto stores the frame type as a public
+`FrameType`, but the raw numeric value is not exposed; its tuple field and known
+constants are private to quinn-proto. QuietQUIC keeps an `Option<u64>` field for
+a future upstream accessor, but does not use unsafe private-layout extraction,
+debug/display string parsing, or a patched quinn-proto dependency. We are not
+submitting an upstream PR for this release and are not committing to submit one
+later.
 
 ### The "extraction only" nuance
 
 A sans-IO core **cannot** offer a blocking `read_to_end` — there is nothing to
 park on — so the core's read primitive is necessarily incremental. This does not
 leak into the public surface: in this sub-project the **`quietquic` crate's
-public API is unchanged**. Its existing `Stream::read_to_end` is reimplemented as
-a loop over the core's incremental read, driven by the tokio driver's existing
-`pending_reads` parking. External behavior is identical, so "every existing test
-passes unmodified" remains a genuine acceptance criterion. Exposing incremental
-reads *publicly* is sub-project 2.
+Tokio `RecvStream::read_to_end` is implemented as a loop over the core's
+incremental read, driven by the tokio driver's `pending_reads` parking.
+Incremental reads are also public through `RecvStream::read(max)`.
 
 ---
 
@@ -194,7 +202,7 @@ reads *publicly* is sub-project 2.
 | `quinn_proto::Endpoint`/`Connection` driving | UDP socket ownership, `tokio::spawn` |
 | **Cloaking pre-filter**: `peek_dcid` → `parse_dcid` → `is_fresh` → `select_psk` → replay guard | the driver's `select!` loop and timers |
 | PSK `Initial` re-keying (`initial_keys.rs`) | command channel + oneshot replies |
-| Rate limiter (takes `now` as a parameter rather than reading the clock) | public `Server`, `Client`, `Connection`, `Stream` |
+| Rate limiter (takes `now` as a parameter rather than reading the clock) | public `Server`, `Client`, `Connection`, `SendStream`, `RecvStream` |
 | Per-stream buffers; the `is_drained()` reaping fix | `pending_reads` parking (now over core primitives) |
 | Config **types** and their parsing (`ServerSecrets`, `ClientConfigFile`, `Psk`, selector, freshness, replay) — deserialization from a string only | **`FileSource`** — it reads the filesystem, and a sans-IO core must not perform I/O of any kind. It also keeps the `chmod 600` warning where the gem already calls it. |
 
@@ -243,11 +251,11 @@ Only after the spike is green does the remaining extraction proceed.
 
 ## 8. Testing
 
-- **Every existing suite passes unmodified.** `cloaking`, `spike_silence`,
-  `server_prefilter`, `client_server_roundtrip`, `connection_lifecycle`, the
-  crate's unit tests, and the Ruby gem's 62 examples. Because the `quietquic`
-  public API is unchanged, no test edits should be required; any test that *must*
-  change is a signal the extraction leaked and needs review.
+- **Every existing behavioral suite passes after API migration.** `cloaking`,
+  `spike_silence`, `server_prefilter`, `client_server_roundtrip`,
+  `connection_lifecycle`, and the crate's unit tests continue to cover the same
+  behavior, with call sites updated for the alpha.3 split stream API where
+  needed.
 - **New core-level tests** in `quietquic-proto`: drive an endpoint pair entirely
   in memory through the public core API — handshake, stream echo, and each silence
   case — with no sockets and no runtime.

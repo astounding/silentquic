@@ -14,9 +14,14 @@
    cargo clippy --workspace --all-targets --all-features -- -D warnings
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
    cargo package -p quietquic-proto
-   cargo package -p quietquic
    cargo deny check
    ```
+
+   For the first public release of the renamed `quietquic-proto` crate, the
+   wrapper package cannot verify until the exact pinned core version is visible
+   in the crates.io index. In that bootstrap case, publish
+   `quietquic-proto` first, wait for indexing, then run
+   `cargo package -p quietquic` before publishing `quietquic`.
 
 5. Run dependency vulnerability, license, and source-policy checks.
 6. Inspect `cargo package --list` for each crate.

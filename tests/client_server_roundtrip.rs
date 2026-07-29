@@ -17,6 +17,8 @@
 //! This is the project's first end-to-end data-flow proof. It also asserts the
 //! `quinn_connection()` forward-compat escape hatch is reachable.
 
+mod common;
+
 use quietquic::client::Client;
 use quietquic::config::{ClientConfigFile, ServerSecrets};
 use quietquic::conn::ConnError;
@@ -27,7 +29,8 @@ async fn authorized_client_completes_handshake_over_udp() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000005";
 
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
 
@@ -70,10 +73,11 @@ async fn authorized_client_completes_handshake_over_udp() {
             .expect("server task should not panic");
     assert_eq!(client_id.as_deref(), Some("a"));
 
-    // Sanity: the server saw a concrete IPv4 source address. A FreeBSD VNET
-    // jail may route a dial to 127.0.0.1 from the jail's primary address, so
-    // requiring the observed peer itself to be loopback is not portable.
-    assert!(server_remote.is_ipv4(), "server accepted an IPv4 peer");
+    assert_eq!(
+        server_remote.is_ipv4(),
+        common::test_ip().is_ipv4(),
+        "server accepted a peer with the selected test address family"
+    );
 }
 
 /// The end-to-end data-flow proof: a real stream echo over real UDP through the
@@ -87,7 +91,8 @@ async fn stream_echo_roundtrips_over_udp() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000006";
 
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
 
@@ -100,23 +105,19 @@ async fn stream_echo_roundtrips_over_udp() {
             .accept()
             .await
             .expect("server should accept an authorized peer");
-        let mut stream = conn
-            .accept_stream()
+        let (mut send, mut recv) = conn
+            .accept_bi()
             .await
             .expect("server should accept a bidirectional stream");
-        let got = stream
+        let got = recv
             .read_to_end(1024)
             .await
             .expect("server should read the stream to end");
         // Echo back what we received.
-        stream
-            .write_all(&got)
+        send.write_all(&got)
             .await
             .expect("server should write the echo");
-        stream
-            .finish()
-            .await
-            .expect("server should finish the echo");
+        send.finish().await.expect("server should finish the echo");
         got
     });
 
@@ -135,20 +136,13 @@ async fn stream_echo_roundtrips_over_udp() {
     let _quinn = conn.quinn_connection();
 
     // Client: open a stream, write "ping", finish, then read the echo back.
-    let mut stream = conn
-        .open_stream()
-        .await
-        .expect("client should open a stream");
-    stream
-        .write_all(b"ping")
+    let (mut send, mut recv) = conn.open_bi().await.expect("client should open a stream");
+    send.write_all(b"ping")
         .await
         .expect("client should write ping");
-    stream
-        .finish()
-        .await
-        .expect("client should finish its send");
+    send.finish().await.expect("client should finish its send");
 
-    let echo = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(1024))
+    let echo = tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(1024))
         .await
         .expect("client read should not time out")
         .expect("client should read the echo");
@@ -165,7 +159,8 @@ async fn stream_echo_roundtrips_over_udp() {
 async fn bounded_read_rejects_oversized_stream() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000016";
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen=\"127.0.0.1:0\"\n[[clients]]\nclient_id=\"bounded\"\npsk=\"{psk_hex}\"\n"
+        "listen=\"{}\"\n[[clients]]\nclient_id=\"bounded\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
     let mut server = Server::bind(secrets).await.unwrap();
@@ -173,9 +168,9 @@ async fn bounded_read_rejects_oversized_stream() {
 
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("accept");
-        let mut stream = conn.accept_stream().await.expect("accept stream");
-        stream.write_all(b"12345").await.expect("write");
-        stream.finish().await.expect("finish");
+        let (mut send, _recv) = conn.accept_bi().await.expect("accept stream");
+        send.write_all(b"12345").await.expect("write");
+        send.finish().await.expect("finish");
     });
 
     let cfg: ClientConfigFile = toml::from_str(&format!(
@@ -183,9 +178,9 @@ async fn bounded_read_rejects_oversized_stream() {
     ))
     .unwrap();
     let conn = Client::connect(cfg).await.expect("connect");
-    let mut stream = conn.open_stream().await.expect("open");
-    stream.finish().await.expect("finish request");
-    let err = stream
+    let (mut send, mut recv) = conn.open_bi().await.expect("open");
+    send.finish().await.expect("finish request");
+    let err = recv
         .read_to_end(4)
         .await
         .expect_err("five bytes must exceed a four-byte limit");
@@ -197,7 +192,8 @@ async fn bounded_read_rejects_oversized_stream() {
 async fn split_stream_reads_incrementally_before_fin() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000009";
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
     let mut server = Server::bind(secrets).await.unwrap();
@@ -205,8 +201,7 @@ async fn split_stream_reads_incrementally_before_fin() {
 
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("server accepts");
-        let stream = conn.accept_stream().await.expect("server accepts stream");
-        let (mut recv, mut send) = stream.split();
+        let (mut send, mut recv) = conn.accept_bi().await.expect("server accepts stream");
         let first = recv.read(3).await.expect("incremental read");
         assert_eq!(first, b"abc");
         send.write_all(b"seen").await.expect("concurrent response");
@@ -221,8 +216,7 @@ async fn split_stream_reads_incrementally_before_fin() {
     ))
     .unwrap();
     let conn = Client::connect(cfg).await.unwrap();
-    let stream = conn.open_stream().await.unwrap();
-    let (mut recv, mut send) = stream.split();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(b"abc").await.unwrap();
     let response = recv.read(16).await.unwrap();
     assert_eq!(response, b"seen");
@@ -244,17 +238,15 @@ async fn client_can_pin_its_local_source_port() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000007";
 
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
     let mut server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     // Grab a free UDP port, then release it for the client to claim.
-    let pinned = {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let pinned = common::reserve_port();
 
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("server should accept");
@@ -262,7 +254,8 @@ async fn client_can_pin_its_local_source_port() {
     });
 
     let cfg: ClientConfigFile = toml::from_str(&format!(
-        "client_id=\"a\"\npsk=\"{psk_hex}\"\nserver=\"{addr}\"\nbind=\"127.0.0.1:{pinned}\"\n"
+        "client_id=\"a\"\npsk=\"{psk_hex}\"\nserver=\"{addr}\"\nbind=\"{}\"\n",
+        common::addr_with_port_string(pinned)
     ))
     .unwrap();
     let conn = tokio::time::timeout(std::time::Duration::from_secs(10), Client::connect(cfg))
@@ -280,7 +273,7 @@ async fn client_can_pin_its_local_source_port() {
         pinned,
         "server must observe the client's pinned source port"
     );
-    conn.close().await;
+    conn.close(0, b"").await.expect("close");
 }
 
 /// A bind address whose IP version differs from the server's is rejected up
@@ -288,8 +281,13 @@ async fn client_can_pin_its_local_source_port() {
 #[tokio::test]
 async fn mismatched_bind_family_is_rejected() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000008";
+    let (server, bind) = if common::test_ip().is_ipv4() {
+        ("127.0.0.1:4433", "[::]:0")
+    } else {
+        ("[::1]:4433", "127.0.0.1:0")
+    };
     let cfg: ClientConfigFile = toml::from_str(&format!(
-        "client_id=\"a\"\npsk=\"{psk_hex}\"\nserver=\"127.0.0.1:4433\"\nbind=\"[::]:0\"\n"
+        "client_id=\"a\"\npsk=\"{psk_hex}\"\nserver=\"{server}\"\nbind=\"{bind}\"\n"
     ))
     .unwrap();
 

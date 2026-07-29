@@ -78,12 +78,14 @@ Several implementation bugs established durable invariants:
 ## Stream API decision
 
 The original Tokio API exposed only unbounded `read_to_end`, which both risks
-memory exhaustion and forced bespoke parked-read state. Incremental bounded
-`read(max)` and split receive/send handles were added when `squicusock` needed
-interactive full-duplex forwarding. The Tokio wrapper now offers
-`read_to_end(limit)` as a bounded convenience over the incremental core path.
-The remaining direction is to implement standard async read/write traits. The
-sans-I/O core already has the correct incremental model.
+memory exhaustion and forced bespoke parked-read state. The public shape now
+matches quinn's bidirectional stream split: `open_bi` / `accept_bi` return
+`(SendStream, RecvStream)`, `RecvStream::read(max)` is incremental, and
+`RecvStream::read_to_end(limit)` is only a bounded convenience over the
+incremental core path. `SendStream::wait_finished` is the transport-level FIN
+acknowledgement barrier; it proves receipt by the peer's QUIC stack, not
+application processing. The remaining direction is to implement standard async
+read/write traits. The sans-I/O core already has the correct incremental model.
 
 ## Validation record
 

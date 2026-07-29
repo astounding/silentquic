@@ -1,5 +1,10 @@
 # quietquic Implementation Plan
 
+> **ARCHIVED / SUPERSEDED:** This is a historical implementation plan, not a
+> current work plan. It preserves old intermediate APIs, unchecked task lists,
+> and examples that may no longer compile. For current usage, prefer the root
+> `README.md`, the current Rust API, and `docs/specs/wire-protocol.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a 0BSD Rust library providing a cloaked QUIC transport: a server invisible to scanners (silent to any peer without a valid PSK), traffic camouflaged as vanilla QUIC v1, PSK auth folded into the QUIC `Initial` via a blinded DCID selector, exposing raw authenticated bidirectional streams.

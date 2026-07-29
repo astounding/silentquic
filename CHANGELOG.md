@@ -3,6 +3,29 @@
 All notable user-visible changes are recorded here. This project follows
 Semantic Versioning while its wire protocol and Rust API remain experimental.
 
+## 0.1.0-alpha.3 — 2026-07-29
+
+- Skip publishing `0.1.0-alpha.2`; alpha.3 is the next intended public crate
+  release.
+- Replace the unsplit Tokio `Stream` API with quinn-shaped bidirectional
+  halves: `Connection::open_bi` / `accept_bi` now return
+  `(SendStream, RecvStream)`.
+- Add send-half completion: `SendStream::wait_finished` and
+  `finish_and_wait` report FIN acknowledgement or peer STOP_SENDING.
+- Add local `SendStream::reset`, `RecvStream::stop`, `Connection::closed`,
+  cloneable `Connection`, and close codes/reasons via
+  `Connection::close(code, reason)`.
+- Replace stringly stream errors with structured `ConnError` variants and add
+  `ConnectionError` for terminal connection facts.
+- Document that `ConnectionError` transport `frame_type` fields are currently
+  `None` with quinn-proto 0.11 because upstream does not expose the raw
+  `FrameType` value.
+- Extend sans-IO events with `StreamOpened { dir }`, `StreamFinAcked`,
+  `StreamStopped`, and `ConnectionLost { reason }`; mark public event/error
+  shapes non-exhaustive.
+- Pin advertised unidirectional stream credit to zero until uni-stream support
+  lands.
+
 ## 0.1.0-alpha.2 — 2026-07-27
 
 - Rename the project and crates from `silentquic`/`silentquic-proto` to

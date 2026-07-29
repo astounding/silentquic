@@ -21,7 +21,7 @@ logic; it exposes raw authenticated bidirectional byte streams for a caller
 (e.g. a backup tool, a config-push agent, anything that wants a QUIC pipe that
 doesn't advertise itself to the internet) to frame however it likes.
 
-> **Release status:** `0.1.0-alpha.2` is an experimental preview. The protocol
+> **Release status:** `0.1.0-alpha.3` is an experimental preview. The protocol
 > has extensive automated tests but has not yet received an independent
 > cryptographic review. Do not treat it as production-hardened.
 
@@ -30,7 +30,7 @@ doesn't advertise itself to the internet) to frame however it likes.
 | Crate | What it is | Use it when |
 |---|---|---|
 | **`quietquic-proto`** (`proto/`) | The **sans-IO core**. No I/O, no async runtime, no threads, and it never blocks or reads the clock — you own the socket and pass `now` in. | You have your own event loop, or you're embedding via FFI |
-| **`quietquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `async` `Server`/`Client`/`Connection`/`Stream`. | Your application is already `async`/`.await` |
+| **`quietquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `async` `Server`/`Client`/`Connection`/`SendStream`/`RecvStream`. | Your application is already `async`/`.await` |
 
 This mirrors `quinn-proto`/`quinn`, and it exists because the two I/O models are
 mutually exclusive: tokio owns the thread and parks in `epoll`/`kqueue` when
@@ -41,6 +41,12 @@ compromising either.
 `proto/examples/poll_loop.rs` is the reference for the sans-IO path — a single
 thread, non-blocking sockets, nothing that parks — and it is run in CI so it
 cannot rot.
+
+Socket integration tests default to loopback. On hosts where loopback UDP is
+filtered or where tests must use an allowlisted interface/port range, set
+`QUIETQUIC_TEST_ADDR` to the local IP to bind/dial and optionally
+`QUIETQUIC_TEST_PORT_BASE` to the first deterministic test port. Without a port
+base, tests bind port `0` and let the OS choose ephemeral ports.
 
 **The silence invariant is stronger in the core.** *A datagram that fails the
 cloaking pre-filter queues nothing to send.* `handle_datagram` returns before
@@ -119,8 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // completed the QUIC handshake — unauthorized peers never reach
             // this point at all.
             println!("authenticated client: {:?}", conn.client_id());
-            let mut stream = conn.accept_stream().await.expect("accept stream");
-            let msg = stream.read_to_end(1024 * 1024).await.expect("read");
+            let (_send, mut recv) = conn.accept_bi().await.expect("accept stream");
+            let msg = recv.read_to_end(1024 * 1024).await.expect("read");
             println!("got {} bytes from {}", msg.len(), conn.remote_address());
         });
     }
@@ -140,25 +146,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg: ClientConfigFile = toml::from_str(&text)?;
 
     let conn = Client::connect(cfg).await?;
-    let mut stream = conn.open_stream().await?;
-    stream.write_all(b"hello over a cloaked pipe").await?;
-    stream.finish().await?;
+    let (mut send, _recv) = conn.open_bi().await?;
+    send.write_all(b"hello over a cloaked pipe").await?;
+    send.finish_and_wait().await?;
     Ok(())
 }
 ```
 
 The primary surface is `Server::bind` / `Server::accept`, `Client::connect`,
-`Connection::open_stream` / `accept_stream` / `close`, and the stream methods
-`read(max)` / `write_all` / `finish` / `read_to_end(limit)` / `split`.
+`Connection::open_bi` / `accept_bi` / `close(code, reason)` / `closed()`,
+`SendStream::write_all` / `finish` / `wait_finished` / `finish_and_wait` /
+`reset`, and `RecvStream::read` / `read_to_end(limit)` / `stop`.
 `Connection::client_id` identifies an accepted peer on the server. Framing on
 top of these raw byte streams is left to the caller.
 
-For full-duplex or untrusted-size traffic, split the stream and read
+For full-duplex or untrusted-size traffic, keep both halves and read
 incrementally:
 
 ```rust,no_run
-# async fn relay(stream: quietquic::conn::Stream) -> Result<(), quietquic::conn::ConnError> {
-let (mut recv, mut send) = stream.split();
+# async fn relay(conn: quietquic::conn::Connection) -> Result<(), quietquic::conn::ConnError> {
+let (mut send, mut recv) = conn.open_bi().await?;
 let reader = async move {
     loop {
         let chunk = recv.read(16 * 1024).await?;
@@ -171,22 +178,39 @@ let reader = async move {
 };
 let writer = async move {
     send.write_all(b"request").await?;
-    send.finish().await
+    send.finish_and_wait().await
 };
 tokio::try_join!(reader, writer)?;
 # Ok(())
 # }
 ```
 
+`finish()` queues FIN and returns once the local transport accepts it.
+`wait_finished()` is the completion barrier: it resolves when the peer's
+transport acknowledges all stream data and FIN, or returns `ConnError::Stopped`
+if the peer sent STOP_SENDING. This is a transport receipt, not proof that the
+peer application read or processed the bytes. Wrap it in
+`tokio::time::timeout` when a policy deadline matters.
+
+`Connection::closed()` returns a structured `ConnectionError`. Application close
+codes and reason bytes are preserved. For transport closes/errors,
+`frame_type` is currently `None` with quinn-proto 0.11: quinn-proto carries the
+frame type internally but does not expose its raw numeric value publicly.
+QuietQUIC deliberately avoids unsafe private-layout extraction, debug-string
+parsing, or a patched quinn-proto dependency; the `Option<u64>` field remains in
+the API for a future upstream accessor if one appears. This release does not
+include, require, or commit to an upstream quinn-proto PR for that accessor.
+
 The underlying `quinn_proto::Connection` is reachable via
 `Connection::quinn_connection()`, which returns a `QuinnHandle` exposing
-bidirectional-stream commands (`open_bi` / `accept_bi`) routed through the same
-driver channel the cloaking layer uses — so the cloaking/routing code does not
-have to change to layer a higher-level protocol on top. Note that this is a
-seam for a FUTURE direction, not a drop-in today: HTTP/3, for example, also
-needs unidirectional streams (h3 uses uni streams for its control stream and
-QPACK encoder/decoder), and the handle does not yet expose uni-stream commands.
-See [Limitations](#limitations--not-yet-production-hardened) below.
+bidirectional-stream commands (`open_bi` / `accept_bi`, plus by-id
+`finish`/`wait_finished`) routed through the same driver channel the cloaking
+layer uses — so the cloaking/routing code does not have to change to layer a
+higher-level protocol on top. Note that this is a seam for a FUTURE direction,
+not a drop-in today: HTTP/3, for example, also needs unidirectional streams (h3
+uses uni streams for its control stream and QPACK encoder/decoder), and the
+handle does not yet expose uni-stream commands. See
+[Limitations](#limitations--not-yet-production-hardened) below.
 
 ---
 
@@ -246,10 +270,10 @@ discovering them under load.
    handful of concurrent clients (the expected backup-transport use case), but
    not tuned for high fan-out (hundreds+ of simultaneous connections on one
    server).
-2. **`Stream::read_to_end(limit)` buffers up to the caller's explicit limit.**
+2. **`RecvStream::read_to_end(limit)` buffers up to the caller's explicit limit.**
    It returns `ConnError::ReadLimitExceeded` if the peer sends more. Interactive
-   applications should still use `Stream::read(max)` or split the stream into
-   independent receive/send handles and process data incrementally.
+   applications should still use `RecvStream::read(max)` and process data
+   incrementally.
 3. **Rate-limit parameters are compile-time constants**, not yet configurable
    via TOML. The per-source and global buckets that bound the unauthenticated
    pre-filter's CPU cost (see Threat Model, resource side-channel) cannot

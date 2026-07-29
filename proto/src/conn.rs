@@ -32,11 +32,11 @@
 //! and hands the rest back as a [`ConnProgress`] for the endpoint to translate
 //! into [`crate::outcome::Event`]s.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use quinn_proto::{Dir, StreamId, VarInt};
 
-use crate::outcome::{ReadOutcome, WriteOutcome};
+use crate::outcome::{ConnectionError, ReadOutcome, WriteOutcome};
 
 /// Errors surfaced by connection and stream operations.
 ///
@@ -44,19 +44,43 @@ use crate::outcome::{ReadOutcome, WriteOutcome};
 /// "no data right now" and "no credit right now" are not errors, they are the
 /// [`ReadOutcome::Blocked`] / [`WriteOutcome::Blocked`] outcomes. What is left
 /// is genuinely exceptional.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnError {
     /// The connection is gone (closed / lost / the driver owning it dropped), so
     /// no further stream work can be done on it.
     #[error("connection closed")]
     Closed,
-    /// The peer or local side reset/stopped the stream, or the stream was
-    /// otherwise refused by the transport.
-    #[error("stream error: {0}")]
-    Stream(String),
+    /// The peer asked us to stop sending on this stream.
+    #[error("stream stopped by peer: code {code}")]
+    Stopped { code: u64 },
+    /// The peer reset the receive half of this stream.
+    #[error("stream reset by peer: code {code}")]
+    Reset { code: u64 },
+    /// The stream is closed, unknown, or locally abandoned.
+    #[error("closed or unknown stream")]
+    ClosedStream,
     /// A bounded convenience read received more bytes than its caller allowed.
     #[error("stream exceeded read limit of {limit} bytes")]
     ReadLimitExceeded { limit: usize },
+    /// Application error codes are QUIC varints.
+    #[error("invalid application error code {code} (exceeds varint range)")]
+    InvalidErrorCode { code: u64 },
+    /// Rare transport error that does not have a structured public variant.
+    #[error("transport: {0}")]
+    Transport(String),
+}
+
+/// Terminal/near-terminal state of a stream's send half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SendFin {
+    /// `stream_finish` succeeded; FIN is not yet fully acknowledged.
+    Queued,
+    /// All data and FIN were acknowledged by the peer.
+    Acked,
+    /// The peer sent STOP_SENDING; the FIN will never be acknowledged.
+    Stopped(u64),
 }
 
 /// What one [`ConnState::service_streams`] pass observed.
@@ -65,6 +89,7 @@ pub enum ConnError {
 /// `ConnState` keeps them structured so it does not have to know a connection's
 /// handle (it does not have one — the endpoint owns that mapping).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnProgress {
     /// The handshake completed this pass.
     pub connected: bool,
@@ -72,7 +97,7 @@ pub struct ConnProgress {
     ///
     /// **Only ever true for a REMOTELY-initiated loss.** See
     /// [`ConnState::is_drained`] for the other half of the story.
-    pub lost: bool,
+    pub lost: Option<ConnectionError>,
     /// Bidirectional streams the peer opened this pass, in arrival order. They
     /// are already queued for [`ConnState::accept_bi`]; this list exists so the
     /// endpoint can emit `StreamOpened`.
@@ -83,6 +108,10 @@ pub struct ConnProgress {
     /// Streams whose flow control opened: a previously `Blocked` write may now
     /// progress.
     pub writable: Vec<StreamId>,
+    /// Send streams whose FIN was acknowledged by the peer.
+    pub fin_acked: Vec<StreamId>,
+    /// Send streams the peer stopped, with the peer's application code.
+    pub stopped: Vec<(StreamId, u64)>,
 }
 
 /// One connection's state: the owned sans-IO connection plus its stream
@@ -121,6 +150,8 @@ pub struct ConnState {
     /// which is precisely why the entry cannot simply be dropped on first
     /// observation.
     finished_reads: HashSet<StreamId>,
+    /// Streams whose send half reached a stable finish/stop fact.
+    send_fins: HashMap<StreamId, SendFin>,
     /// Set by any caller-side operation that can produce something to send, and
     /// cleared by the endpoint's servicing pass that flushes it.
     ///
@@ -143,6 +174,7 @@ impl ConnState {
             conn,
             ready_accepts: VecDeque::new(),
             finished_reads: HashSet::new(),
+            send_fins: HashMap::new(),
             dirty: false,
         }
     }
@@ -159,7 +191,7 @@ impl ConnState {
         self.conn
             .streams()
             .open(Dir::Bi)
-            .ok_or_else(|| ConnError::Stream("no bidirectional stream credit".into()))
+            .ok_or(ConnError::ClosedStream)
     }
 
     /// Take the next peer-opened bidirectional stream, or `None` if none is
@@ -212,15 +244,17 @@ impl ConnState {
             Ok(chunks) => chunks,
             // The receive half is gone. If we never observed FIN ourselves the
             // stream was stopped or reset, which is a genuine error.
-            Err(ReadableError::ClosedStream) => {
-                return Err(ConnError::Stream("read: closed stream".into()))
+            Err(ReadableError::ClosedStream) => return Err(ConnError::ClosedStream),
+            Err(ReadableError::IllegalOrderedRead) => {
+                return Err(ConnError::Transport(
+                    "ordered read after unordered read".into(),
+                ))
             }
-            Err(e) => return Err(ConnError::Stream(format!("read: {e:?}"))),
         };
 
         let mut filled = 0usize;
         let mut finished = false;
-        let mut errored: Option<String> = None;
+        let mut errored: Option<ConnError> = None;
         while filled < buf.len() {
             // `Chunks::next` never yields more than the requested length, so the
             // caller's buffer bounds the read and nothing has to be stashed.
@@ -235,8 +269,10 @@ impl ConnState {
                     break;
                 }
                 Err(ReadError::Blocked) => break,
-                Err(e) => {
-                    errored = Some(format!("read: {e:?}"));
+                Err(ReadError::Reset(code)) => {
+                    errored = Some(ConnError::Reset {
+                        code: code.into_inner(),
+                    });
                     break;
                 }
             }
@@ -259,8 +295,8 @@ impl ConnState {
         if filled > 0 {
             return Ok(ReadOutcome::Read(filled));
         }
-        if let Some(msg) = errored {
-            return Err(ConnError::Stream(msg));
+        if let Some(err) = errored {
+            return Err(err);
         }
         Ok(if finished {
             ReadOutcome::Finished
@@ -289,17 +325,33 @@ impl ConnState {
         match self.conn.send_stream(id).write(buf) {
             Ok(n) => Ok(WriteOutcome::Wrote(n)),
             Err(WriteError::Blocked) => Ok(WriteOutcome::Blocked),
-            Err(e) => Err(ConnError::Stream(format!("write: {e:?}"))),
+            Err(WriteError::Stopped(code)) => Err(ConnError::Stopped {
+                code: code.into_inner(),
+            }),
+            Err(WriteError::ClosedStream) => Err(ConnError::ClosedStream),
         }
     }
 
     /// Finish (FIN) the send half of `id`, signalling end-of-data to the peer.
     pub fn stream_finish(&mut self, id: StreamId) -> Result<(), ConnError> {
+        match self.send_fins.get(&id).copied() {
+            Some(SendFin::Stopped(code)) => return Err(ConnError::Stopped { code }),
+            Some(SendFin::Acked | SendFin::Queued) => return Err(ConnError::ClosedStream),
+            None => {}
+        }
         self.dirty = true;
-        self.conn
-            .send_stream(id)
-            .finish()
-            .map_err(|e| ConnError::Stream(format!("finish: {e:?}")))
+        match self.conn.send_stream(id).finish() {
+            Ok(()) => {
+                self.send_fins.insert(id, SendFin::Queued);
+                Ok(())
+            }
+            Err(quinn_proto::FinishError::Stopped(code)) => {
+                let code = code.into_inner();
+                self.record_send_fin(id, SendFin::Stopped(code));
+                Err(ConnError::Stopped { code })
+            }
+            Err(quinn_proto::FinishError::ClosedStream) => Err(ConnError::ClosedStream),
+        }
     }
 
     /// Abandon the send half of `id` with an application error code, discarding
@@ -314,10 +366,11 @@ impl ConnState {
         let code = varint(code)?;
         self.dirty = true;
         self.finished_reads.remove(&id);
+        self.send_fins.remove(&id);
         self.conn
             .send_stream(id)
             .reset(code)
-            .map_err(|e| ConnError::Stream(format!("reset: {e:?}")))
+            .map_err(|_| ConnError::ClosedStream)
     }
 
     /// Tell the peer to stop sending on `id`, with an application error code.
@@ -332,7 +385,7 @@ impl ConnState {
         self.conn
             .recv_stream(id)
             .stop(code)
-            .map_err(|e| ConnError::Stream(format!("stop: {e:?}")))
+            .map_err(|_| ConnError::ClosedStream)
     }
 
     /// Drop every trace of `id` from this connection's per-stream bookkeeping.
@@ -351,7 +404,23 @@ impl ConnState {
     /// contract — "done" means done. It is idempotent and never fails; forgetting
     /// a stream that was never known is a no-op.
     pub fn forget_stream(&mut self, id: StreamId) {
+        self.forget_recv(id);
+        self.forget_send(id);
+    }
+
+    /// Release this stream's stable receive end-of-stream fact.
+    pub fn forget_recv(&mut self, id: StreamId) {
         self.finished_reads.remove(&id);
+    }
+
+    /// Release this stream's stable send-half finish/stop fact.
+    pub fn forget_send(&mut self, id: StreamId) {
+        self.send_fins.remove(&id);
+    }
+
+    /// The current stable/near-stable send FIN fact, if any.
+    pub fn send_fin(&self, id: StreamId) -> Option<SendFin> {
+        self.send_fins.get(&id).copied()
     }
 
     /// Drain the connection's application events, queue peer-opened streams for
@@ -367,7 +436,9 @@ impl ConnState {
         while let Some(ev) = self.conn.poll() {
             match ev {
                 Event::Connected => progress.connected = true,
-                Event::ConnectionLost { .. } => progress.lost = true,
+                Event::ConnectionLost { reason } => {
+                    progress.lost = Some(ConnectionError::from_quinn(reason));
+                }
                 Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
                     while let Some(id) = self.conn.streams().accept(Dir::Bi) {
                         self.ready_accepts.push_back(id);
@@ -376,10 +447,31 @@ impl ConnState {
                 }
                 Event::Stream(StreamEvent::Readable { id }) => progress.readable.push(id),
                 Event::Stream(StreamEvent::Writable { id }) => progress.writable.push(id),
+                Event::Stream(StreamEvent::Finished { id }) => {
+                    if self.record_send_fin(id, SendFin::Acked) {
+                        progress.fin_acked.push(id);
+                    }
+                }
+                Event::Stream(StreamEvent::Stopped { id, error_code }) => {
+                    let code = error_code.into_inner();
+                    if self.record_send_fin(id, SendFin::Stopped(code)) {
+                        progress.stopped.push((id, code));
+                    }
+                }
                 _ => {}
             }
         }
         progress
+    }
+
+    fn record_send_fin(&mut self, id: StreamId, fact: SendFin) -> bool {
+        match self.send_fins.get(&id).copied() {
+            Some(SendFin::Acked | SendFin::Stopped(_)) => false,
+            Some(SendFin::Queued) | None => {
+                self.send_fins.insert(id, fact);
+                matches!(fact, SendFin::Acked | SendFin::Stopped(_))
+            }
+        }
     }
 
     /// Whether quinn-proto considers this connection fully terminated.
@@ -445,6 +537,7 @@ impl std::fmt::Debug for ConnState {
             .field("remote", &self.conn.remote_address())
             .field("ready_accepts", &self.ready_accepts.len())
             .field("finished_reads", &self.finished_reads.len())
+            .field("send_fins", &self.send_fins.len())
             .field("dirty", &self.dirty)
             .finish()
     }
@@ -453,6 +546,5 @@ impl std::fmt::Debug for ConnState {
 /// Application error codes are QUIC varints; anything wider is a caller bug, not
 /// a transport condition.
 fn varint(code: u64) -> Result<VarInt, ConnError> {
-    VarInt::from_u64(code)
-        .map_err(|_| ConnError::Stream(format!("error code {code} exceeds the varint range")))
+    VarInt::from_u64(code).map_err(|_| ConnError::InvalidErrorCode { code })
 }

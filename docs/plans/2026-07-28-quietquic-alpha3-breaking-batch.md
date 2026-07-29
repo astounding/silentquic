@@ -132,9 +132,10 @@ Lives in `quietquic-proto::outcome`; RE-EXPORTED from the root crate as
 `ConnError` re-export, so `Connection::closed()`'s return type has an
 obvious import path. Returned by `closed()`; carried by
 `Event::ConnectionLost`. Mirrors quinn's variant set, with reason bytes
-AND structured codes preserved (all of quinn-proto's underlying data is
-cleanly numeric: `TransportErrorCode` wraps a bare `u64`, `FrameType` is
-a varint — no lossy mapping needed):
+AND structured codes preserved. `TransportErrorCode` maps cleanly to
+`u64`; frame types are represented as `Option<u64>` but are currently
+`None` under quinn-proto 0.11 because quinn-proto's public `FrameType`
+does not expose its raw numeric value:
 
     #[non_exhaustive]
     #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -161,6 +162,14 @@ Mapped from `quinn_proto::ConnectionError` at the single point the core
 observes loss today; the `is_drained()` self-close reap path reports
 `LocallyClosed`. Stream ops still fail with plain `ConnError::Closed`;
 callers who want the rich reason use `closed()`.
+
+Frame-type decision (resolved): keep the `Option<u64>` fields, but do not
+work around quinn-proto 0.11's private `FrameType(u64)` representation.
+No unsafe layout extraction, no debug/display string parsing, and no
+patched quinn-proto dependency. QuietQUIC is also not submitting an
+upstream PR for this release and is not committing to submit one later;
+if upstream exposes a raw accessor in the future, these fields can start
+carrying values without another public API change.
 
 Decision D1 (unchanged): the shared structured `ConnError` above
 (recommended) vs additional per-operation quinn-parity enums
@@ -331,9 +340,9 @@ additive later.
 
 `proto/src/endpoint.rs`: translate the new `ConnProgress` fields in the
 same staging loop; map `quinn_proto::ConnectionError` → §3b at the
-single loss point (self-close reap → `LocallyClosed`; `ConnectionClose`
-/ `ApplicationClose` / `TransportError` fields map numerically —
-`TransportErrorCode` and `FrameType` are `u64`-clean).
+single loss point (self-close reap → `LocallyClosed`; `ApplicationClose`
+and close/error codes map numerically; `frame_type` remains `None` under
+quinn-proto 0.11 for the resolved reason in §3b).
 
 `proto/examples/poll_loop.rs`: add match arms — the sans-IO consumer
 demo must show the new events, not lose them in a wildcard.
@@ -449,9 +458,10 @@ Sans-IO (`proto/tests/`), driving both endpoints by hand:
 - core_endpoint.rs: `StreamFinAcked`/`StreamStopped` carry the right
   handle/id/code; `ConnectionLost` carries the right `ConnectionError`
   incl. reason bytes and structured codes for peer app close, peer
-  transport close (frame_type), `TimedOut`, `TransportError`, and
-  `LocallyClosed` on the `is_drained()` reap path; `StreamOpened`
-  carries `dir`; a peer attempting `open_uni` gets no credit
+  transport close (with `frame_type: None` under quinn-proto 0.11),
+  `TimedOut`, `TransportError`, and `LocallyClosed` on the `is_drained()`
+  reap path; `StreamOpened` carries `dir`; a peer attempting `open_uni`
+  gets no credit
   (`max_concurrent_uni_streams(0)`).
 - Error taxonomy: mapped `map_err` sites produce their variants; no
   test asserts on error strings.
@@ -576,7 +586,9 @@ Inspect both `.crate` archives; record source commit and checksums.
   are `u64` + eager validation + `InvalidErrorCode` — `quinn_proto::
   VarInt` stays out of all public signatures; `ConnectionError` (quinn's
   name, quietquic::conn re-export) replaces `LostReason` and preserves
-  structured codes, frame types, and reason bytes; close reasons are
+  structured codes and reason bytes; `frame_type` is an `Option<u64>` that
+  remains `None` with quinn-proto 0.11 because the raw value is not exposed;
+  close reasons are
   documented as wire-truncated by quinn-proto, no API bound.
 
 ## 13. Implementation cautions (from final review; normative)

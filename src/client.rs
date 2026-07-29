@@ -8,7 +8,8 @@
 //! certificate verification skipped (the PSK authenticates, not the cert), and
 //! the per-connection state machine. What is left here is the part that needs a
 //! runtime: a UDP socket, a timer, and the channels behind the public
-//! [`Connection`] / [`crate::conn::Stream`] handles.
+//! [`Connection`] / [`crate::conn::SendStream`] / [`crate::conn::RecvStream`]
+//! handles.
 //!
 //! # The pump
 //!
@@ -56,7 +57,7 @@ use quietquic_proto::freshness::now_minutes;
 use quietquic_proto::outcome::ConnectionHandle;
 use quietquic_proto::outcome::Event as CoreEvent;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{ClientConfigFile, ConfigError};
 use crate::conn::{CmdSender, Connection, Parked, Tagged};
@@ -243,9 +244,9 @@ struct ClientDriver {
     /// Parked handle operations (reads/writes/accepts the core answered "not
     /// right now") for `handle`. The tokio layer's whole per-connection state.
     parked: Parked,
-    /// The command channel the surfaced [`Connection`] / [`Stream`] handles
-    /// enqueue onto. The driver keeps its own sender so `cmd_rx.recv()` never
-    /// resolves to `None` while the driver lives.
+    /// The command channel the surfaced [`Connection`] / stream handles enqueue
+    /// onto. The driver keeps its own sender so `cmd_rx.recv()` never resolves
+    /// to `None` while the driver lives.
     cmd_tx: mpsc::Sender<Tagged>,
     cmd_rx: mpsc::Receiver<Tagged>,
     /// Fires once, with the `Connection` on `Event::Connected` or an error if the
@@ -261,11 +262,12 @@ impl ClientDriver {
         connected: oneshot::Sender<Result<Connection, ClientError>>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
+        let (closed_tx, _closed_rx) = watch::channel(None);
         Self {
             socket,
             core,
             handle,
-            parked: Parked::default(),
+            parked: Parked::new(closed_tx),
             cmd_tx,
             cmd_rx,
             connected: Some(connected),
@@ -390,9 +392,24 @@ impl ClientDriver {
                 }
                 false
             }
-            CoreEvent::ConnectionLost { conn } if conn == self.handle => {
+            CoreEvent::StreamFinAcked { conn, id } if conn == self.handle => {
+                self.parked.on_fin_acked(id);
+                false
+            }
+            CoreEvent::StreamStopped {
+                conn,
+                id,
+                error_code,
+            } if conn == self.handle => {
+                if let Some(state) = self.core.conn_mut(conn) {
+                    self.parked.on_stopped(state, id, error_code);
+                }
+                false
+            }
+            CoreEvent::ConnectionLost { conn, reason } if conn == self.handle => {
                 // Wake anything awaiting a stream op with `Closed` rather than
                 // letting the handles hang on a silently-dropped sender.
+                self.parked.mark_closed(reason);
                 self.parked.fail_all();
                 // If the handshake never completed, tell the waiter so it does
                 // not sit out the connect timeout for a connection already gone.
@@ -420,7 +437,8 @@ impl ClientDriver {
         };
         let remote = state.conn().remote_address();
         let cmds = CmdSender::new(self.handle, self.cmd_tx.clone());
-        let _ = tx.send(Ok(Connection::new(self.handle, remote, None, cmds)));
+        let closed = self.parked.subscribe_closed();
+        let _ = tx.send(Ok(Connection::new(self.handle, remote, None, cmds, closed)));
     }
 
     /// Route one handle-issued command to the connection.
@@ -443,6 +461,20 @@ mod tests {
     use super::*;
     use crate::config::ClientConfigFile;
 
+    fn test_bind_addr() -> SocketAddr {
+        let ip = std::env::var("QUIETQUIC_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+        let port = std::env::var("QUIETQUIC_TEST_PORT_BASE")
+            .ok()
+            .and_then(|base| base.parse::<u16>().ok())
+            .and_then(|base| base.checked_add(2000))
+            .unwrap_or(0);
+        SocketAddr::new(
+            ip.parse()
+                .expect("QUIETQUIC_TEST_ADDR must be an IP address"),
+            port,
+        )
+    }
+
     /// A server that never sends a single byte back must not hang `connect`
     /// forever: with a short internal timeout, `connect_with_timeout` must
     /// return `ClientError::TimedOut` well within a bounded wall-clock budget.
@@ -455,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn connect_times_out_when_nothing_answers() {
         let silent_addr = {
-            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let socket = UdpSocket::bind(test_bind_addr()).await.unwrap();
             let addr = socket.local_addr().unwrap();
             drop(socket);
             addr

@@ -172,8 +172,9 @@ selector construction**. The design must not foreclose this.
 
 ## 6. API Surface
 
-- `open_stream()` / `accept_stream()` return **bidirectional authenticated byte
-  streams**. The consumer (e.g. the backup protocol) supplies its own framing.
+- `open_bi()` / `accept_bi()` return split send/receive halves for
+  **bidirectional authenticated byte streams**. The consumer (e.g. the backup
+  protocol) supplies its own framing.
 - The underlying **`quinn::Connection` remains reachable**, so `h3` or any other
   stream protocol can be layered later **without modifying the cloaking layer**.
 - **Architectural principle:** *cloaking is a property of connection establishment

@@ -21,8 +21,9 @@
 
 use quinn_proto::{Dir, Side};
 
-use quietquic_proto::outcome::{ReadOutcome, WriteOutcome};
-use quietquic_proto::testing::connected_pair;
+use quietquic_proto::conn::{ConnError, SendFin};
+use quietquic_proto::outcome::{Event, ReadOutcome, WriteOutcome};
+use quietquic_proto::testing::{connected_pair, Pair};
 
 // ---------------------------------------------------------------------------
 // The dirty guarantee
@@ -207,5 +208,127 @@ fn resetting_the_send_half_does_not_break_post_fin_reads() {
         Some(ReadOutcome::Finished),
         "resetting the send half must not cost the receive half its stable \
          end-of-stream answer"
+    );
+}
+
+fn drive_until_send_fin(pair: &mut Pair, side: Side, id: quinn_proto::StreamId, fact: SendFin) {
+    for _ in 0..256 {
+        pair.drive();
+        if pair.conn(side).send_fin(id) == Some(fact) {
+            return;
+        }
+        pair.fire_timers();
+    }
+    panic!("send_fin({id:?}) never reached {fact:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The `send_fins` completion contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn finish_records_queued_until_the_peer_acks_the_fin() {
+    let mut pair = connected_pair();
+
+    let id = pair.open_bi(Side::Client);
+    pair.write_all(Side::Client, id, b"payload");
+    pair.conn(Side::Client).stream_finish(id).expect("finish");
+
+    assert_eq!(
+        pair.conn(Side::Client).send_fin(id),
+        Some(SendFin::Queued),
+        "a successful local finish records the in-flight FIN before any peer ack"
+    );
+
+    pair.drive();
+    assert_eq!(pair.accept_bi(Side::Server), id);
+    assert_eq!(&pair.pump_until_read(Side::Server, id), b"payload");
+    drive_until_send_fin(&mut pair, Side::Client, id, SendFin::Acked);
+
+    assert_eq!(
+        pair.conn(Side::Client).send_fin(id),
+        Some(SendFin::Acked),
+        "transport ack of the FIN becomes a durable send-half fact"
+    );
+    assert!(
+        pair.events(Side::Client).iter().any(|event| matches!(
+            event,
+            Event::StreamFinAcked { id: event_id, .. } if *event_id == id
+        )),
+        "the endpoint surfaces the FIN ack as a StreamFinAcked event"
+    );
+    assert_eq!(
+        pair.conn(Side::Client).stream_finish(id),
+        Err(ConnError::ClosedStream),
+        "finish after an ack is short-circuited from the core fact"
+    );
+}
+
+#[test]
+fn peer_stop_before_finish_is_recorded_and_controls_later_finish() {
+    let mut pair = connected_pair();
+
+    let id = pair.open_bi(Side::Client);
+    pair.write_all(Side::Client, id, b"payload");
+    pair.drive();
+    assert_eq!(pair.accept_bi(Side::Server), id);
+
+    pair.conn(Side::Server)
+        .stream_stop(id, 42)
+        .expect("server stop");
+    pair.drive();
+
+    assert_eq!(
+        pair.conn(Side::Client).send_fin(id),
+        Some(SendFin::Stopped(42)),
+        "STOP_SENDING is recorded even without a prior local finish"
+    );
+    assert!(
+        pair.events(Side::Client).iter().any(|event| matches!(
+            event,
+            Event::StreamStopped {
+                id: event_id,
+                error_code: 42,
+                ..
+            } if *event_id == id
+        )),
+        "the endpoint surfaces the peer stop with the application code"
+    );
+    assert_eq!(
+        pair.conn(Side::Client).stream_finish(id),
+        Err(ConnError::Stopped { code: 42 }),
+        "finish after a peer stop returns the recorded stop code"
+    );
+}
+
+#[test]
+fn receive_release_does_not_forget_send_completion_state() {
+    let mut pair = connected_pair();
+
+    let id = pair.open_bi(Side::Client);
+    pair.write_all(Side::Client, id, b"request");
+    pair.conn(Side::Client).stream_finish(id).expect("finish");
+    pair.drive();
+    assert_eq!(pair.accept_bi(Side::Server), id);
+    assert_eq!(&pair.pump_until_read(Side::Server, id), b"request");
+    drive_until_send_fin(&mut pair, Side::Client, id, SendFin::Acked);
+
+    pair.write_all(Side::Server, id, b"response");
+    pair.conn(Side::Server).stream_finish(id).expect("finish");
+    pair.drive();
+    assert_eq!(&pair.pump_until_read(Side::Client, id), b"response");
+
+    pair.conn(Side::Client).forget_recv(id);
+    assert_eq!(
+        pair.conn(Side::Client).send_fin(id),
+        Some(SendFin::Acked),
+        "releasing receive-side EOS must not erase the send-side terminal fact"
+    );
+
+    pair.conn(Side::Client).forget_send(id);
+    assert_eq!(
+        pair.conn(Side::Client).send_fin(id),
+        None,
+        "send facts still have their own explicit release"
     );
 }

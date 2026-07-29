@@ -8,7 +8,7 @@
 //! that pre-filter, the per-PSK transport configs, connection admission,
 //! servicing and reaping. What is left here is the part that genuinely needs a
 //! runtime: a UDP socket, a timer, and the channels behind the public
-//! [`Connection`] / [`Stream`] handles.
+//! [`Connection`] / stream handles.
 //!
 //! # The pump
 //!
@@ -54,12 +54,14 @@ use quietquic_proto::endpoint::Endpoint as Core;
 use quietquic_proto::outcome::ConnectionHandle;
 use quietquic_proto::outcome::Event as CoreEvent;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::ServerSecrets;
 use crate::conn::{CmdSender, Parked, Tagged};
 
-pub use crate::conn::{ConnError, Connection, QuinnHandle, Stream};
+pub use crate::conn::{
+    ConnError, Connection, ConnectionError, QuinnHandle, RecvStream, SendStream,
+};
 
 /// Max UDP datagram we will read.
 const MAX_DATAGRAM: usize = 65_535;
@@ -178,7 +180,7 @@ struct Driver {
     /// Single command channel shared across all connections' handles. Each
     /// [`Tagged`] command names the connection it targets; the driver routes it
     /// to the matching [`Parked`] + core connection. Cloned (pre-tagged) into
-    /// every `Connection` / `Stream` handle the driver hands out.
+    /// every connection / stream handle the driver hands out.
     cmd_tx: mpsc::Sender<Tagged>,
     cmd_rx: mpsc::Receiver<Tagged>,
 }
@@ -335,7 +337,24 @@ impl Driver {
                     parked.on_writable(state, id);
                 }
             }
-            CoreEvent::ConnectionLost { conn } => self.on_lost(conn),
+            CoreEvent::StreamFinAcked { conn, id } => {
+                if let Some(parked) = self.parked.get_mut(&conn) {
+                    parked.on_fin_acked(id);
+                }
+            }
+            CoreEvent::StreamStopped {
+                conn,
+                id,
+                error_code,
+            } => {
+                if let (Some(parked), Some(state)) =
+                    (self.parked.get_mut(&conn), self.core.conn_mut(conn))
+                {
+                    parked.on_stopped(state, id, error_code);
+                }
+            }
+            CoreEvent::ConnectionLost { conn, reason } => self.on_lost(conn, reason),
+            _ => {}
         }
     }
 
@@ -355,10 +374,16 @@ impl Driver {
             return;
         };
         let remote = state.conn().remote_address();
-        self.parked.insert(ch, Parked::default());
+        let (closed_tx, _closed_rx) = watch::channel(None);
+        self.parked.insert(ch, Parked::new(closed_tx));
+        let closed = self
+            .parked
+            .get(&ch)
+            .expect("parked inserted")
+            .subscribe_closed();
         let cmds = CmdSender::new(ch, self.cmd_tx.clone());
         self.pending_accept
-            .push_back(Connection::new(ch, remote, client_id, cmds));
+            .push_back(Connection::new(ch, remote, client_id, cmds, closed));
     }
 
     /// A connection is gone. **Every** retained copy of its handle is dropped
@@ -379,7 +404,10 @@ impl Driver {
     /// transition, and `pump` drains every queued event before the next
     /// `select!` arm can feed the core again. So no accept can reuse `ch`
     /// between the reap and this cleanup.
-    fn on_lost(&mut self, ch: ConnectionHandle) {
+    fn on_lost(&mut self, ch: ConnectionHandle, reason: ConnectionError) {
+        if let Some(parked) = self.parked.get(&ch) {
+            parked.mark_closed(reason);
+        }
         if let Some(mut parked) = self.parked.remove(&ch) {
             // Wake anything awaiting a stream op with `Closed` rather than
             // letting the handles hang on a silently-dropped sender.
@@ -410,6 +438,16 @@ impl Driver {
 mod tests {
     use super::*;
 
+    fn test_bind_addr() -> String {
+        let ip = std::env::var("QUIETQUIC_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+        let port = std::env::var("QUIETQUIC_TEST_PORT_BASE")
+            .ok()
+            .and_then(|base| base.parse::<u16>().ok())
+            .and_then(|base| base.checked_add(1000))
+            .unwrap_or(0);
+        format!("{ip}:{port}")
+    }
+
     /// Regression proof for the non-blocking accept-delivery fix: a full accept
     /// channel plus queued-but-undelivered connections must NOT freeze the driver.
     ///
@@ -428,7 +466,8 @@ mod tests {
 
         let psk_hex = "0000000000000000000000000000000000000000000000000000000000000009";
         let secrets: ServerSecrets = toml::from_str(&format!(
-            "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+            "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+            test_bind_addr()
         ))
         .unwrap();
 
@@ -466,16 +505,16 @@ mod tests {
         // THE PROOF: with B/C undelivered and the accept channel full, A's stream
         // must still round-trip. If the driver were frozen on a blocking send,
         // this echo would time out.
-        let mut a_stream = client_a.open_stream().await.expect("A opens a stream");
-        a_stream.write_all(b"still-alive").await.expect("A writes");
-        a_stream.finish().await.expect("A finishes");
+        let (mut a_send, mut a_recv) = client_a.open_bi().await.expect("A opens a stream");
+        a_send.write_all(b"still-alive").await.expect("A writes");
+        a_send.finish().await.expect("A finishes");
 
-        let mut srv_stream =
-            tokio::time::timeout(std::time::Duration::from_secs(10), conn_a.accept_stream())
+        let (mut srv_send, mut srv_recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), conn_a.accept_bi())
                 .await
                 .expect("server servicing A must not be frozen by a full accept channel")
                 .expect("server accepts A's stream");
-        let got = srv_stream
+        let got = srv_recv
             .read_to_end(1024)
             .await
             .expect("server reads A's stream");
@@ -483,22 +522,14 @@ mod tests {
             &got, b"still-alive",
             "A's stream data must flow while B/C wait"
         );
-        srv_stream
-            .write_all(&got)
-            .await
-            .expect("server echoes to A");
-        srv_stream
-            .finish()
-            .await
-            .expect("server finishes echo to A");
+        srv_send.write_all(&got).await.expect("server echoes to A");
+        srv_send.finish().await.expect("server finishes echo to A");
 
-        let echo = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            a_stream.read_to_end(1024),
-        )
-        .await
-        .expect("A's echo read must not time out")
-        .expect("A reads the echo");
+        let echo =
+            tokio::time::timeout(std::time::Duration::from_secs(10), a_recv.read_to_end(1024))
+                .await
+                .expect("A's echo read must not time out")
+                .expect("A reads the echo");
         assert_eq!(
             &echo, b"still-alive",
             "A round-trips while B/C sit undelivered"

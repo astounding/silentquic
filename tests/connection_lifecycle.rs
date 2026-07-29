@@ -34,6 +34,8 @@ use quietquic::server::Server;
 use std::time::Duration;
 use tokio::time::timeout;
 
+mod common;
+
 /// A single connect/stream/accept/close cycle must never hang, and this must hold
 /// across enough cycles that quinn-proto reuses a `ConnectionHandle` freed by a
 /// prior locally-initiated close. 48 > the historical ~32-cycle collision point.
@@ -46,7 +48,8 @@ async fn server_side_close_is_reaped_across_many_cycles() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000009";
 
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
 
@@ -65,9 +68,9 @@ async fn server_side_close_is_reaped_across_many_cycles() {
         .unwrap();
         let client_task = tokio::spawn(async move {
             let conn = Client::connect(cfg).await.expect("client connect");
-            let mut s = conn.open_stream().await.expect("client open_stream");
-            s.write_all(PAYLOAD).await.expect("client write_all");
-            s.finish().await.expect("client finish");
+            let (mut send, _recv) = conn.open_bi().await.expect("client open_bi");
+            send.write_all(PAYLOAD).await.expect("client write_all");
+            send.finish().await.expect("client finish");
             conn
         });
 
@@ -82,11 +85,11 @@ async fn server_side_close_is_reaped_across_many_cycles() {
             ),
         };
 
-        let mut server_stream = timeout(STEP, server_conn.accept_stream())
+        let (_server_send, mut server_recv) = timeout(STEP, server_conn.accept_bi())
             .await
-            .unwrap_or_else(|_| panic!("accept_stream hung on cycle {cycle}"))
-            .expect("server accept_stream");
-        let got = timeout(STEP, server_stream.read_to_end(1024))
+            .unwrap_or_else(|_| panic!("accept_bi hung on cycle {cycle}"))
+            .expect("server accept_bi");
+        let got = timeout(STEP, server_recv.read_to_end(1024))
             .await
             .unwrap_or_else(|_| panic!("read_to_end hung on cycle {cycle}"))
             .expect("server read_to_end");
@@ -99,15 +102,17 @@ async fn server_side_close_is_reaped_across_many_cycles() {
 
         // The previously-broken path: the SERVER side locally closes the
         // connection. Its handle must be reaped so the next cycle's accept works.
-        timeout(STEP, server_conn.close())
+        timeout(STEP, server_conn.close(0, b""))
             .await
-            .unwrap_or_else(|_| panic!("server close hung on cycle {cycle}"));
+            .unwrap_or_else(|_| panic!("server close hung on cycle {cycle}"))
+            .expect("server close");
 
         // Also close the client side locally, exercising the mirrored
         // `ClientDriver` reaping fix (a self-closed client driver must not wedge).
-        timeout(STEP, client_conn.close())
+        timeout(STEP, client_conn.close(0, b""))
             .await
-            .unwrap_or_else(|_| panic!("client close hung on cycle {cycle}"));
+            .unwrap_or_else(|_| panic!("client close hung on cycle {cycle}"))
+            .expect("client close");
 
         // Both connections drop here; the next iteration reuses the same server.
     }

@@ -137,8 +137,15 @@ fn a_locally_closed_connection_is_reaped_and_reports_connection_lost() {
          alone leaks the handle until a reused one wedges accept"
     );
     assert!(
-        pair.events(Side::Client)
-            .contains(&Event::ConnectionLost { conn: ch }),
+        pair.events(Side::Client).iter().any(|event| {
+            matches!(
+                event,
+                Event::ConnectionLost {
+                    conn,
+                    reason: quietquic_proto::outcome::ConnectionError::LocallyClosed
+                } if *conn == ch
+            )
+        }),
         "the reap must surface ConnectionLost so the caller knows the handle is dead; \
          got {:?}",
         pair.events(Side::Client)

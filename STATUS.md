@@ -11,12 +11,13 @@ Known limitations and the threat boundary are documented in [README.md](README.m
 
 ## Release status
 
-Version `0.1.0-alpha.2` is the first prerelease prepared under the QuietQUIC
-crate names. The version was advanced instead of reusing the existing
-`v0.1.0-alpha.1` tag and former-name publication identity. It remains an
-experimental preview, not a production-hardening claim. Public connection
-handles are generation-safe, accepted server connections expose their
-PSK-derived `client_id`, and `read_to_end` requires an explicit memory bound.
+Version `0.1.0-alpha.3` is the current prerelease under the QuietQUIC crate
+names; `0.1.0-alpha.2` was prepared in git but is being skipped for
+publication. It remains an experimental preview, not a production-hardening
+claim. Public connection handles are generation-safe, accepted server
+connections expose their PSK-derived `client_id`, stream handles use
+quinn-shaped send/receive halves, and `read_to_end` requires an explicit memory
+bound.
 
 The Ruby binding, backup application, and `squicusock` relay are maintained as
 independent projects.

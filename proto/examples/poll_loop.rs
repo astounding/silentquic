@@ -176,10 +176,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while let Some(ev) = server.endpoint.poll_event() {
             match ev {
-                Event::StreamOpened { conn, id } => server_stream = Some((conn, id)),
+                Event::StreamOpened { conn, id, .. } => server_stream = Some((conn, id)),
                 // A handle is invalid the moment this fires — quinn-proto hands
                 // freed handles straight back out, so drop yours here.
-                Event::ConnectionLost { conn } if server_stream.map(|(c, _)| c) == Some(conn) => {
+                Event::ConnectionLost { conn, .. }
+                    if server_stream.map(|(c, _)| c) == Some(conn) =>
+                {
                     server_stream = None;
                 }
                 _ => {}

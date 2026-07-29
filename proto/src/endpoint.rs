@@ -73,7 +73,7 @@ use std::time::Instant;
 use bytes::BytesMut;
 use quinn_proto::{
     ClientConfig as TransportClientConfig, ConnectionHandle as QuinnConnectionHandle, ConnectionId,
-    DatagramEvent, EndpointConfig, ServerConfig as TransportServerConfig,
+    DatagramEvent, EndpointConfig, ServerConfig as TransportServerConfig, TransportConfig, VarInt,
 };
 
 use crate::config::{ClientConfigFile, ConfigError, Psk, ServerSecrets};
@@ -83,7 +83,7 @@ use crate::crypto::{
 };
 use crate::freshness::{is_fresh, now_minutes, WINDOW_MINUTES};
 use crate::initial_keys::{PskClientConfig, PskServerConfig};
-use crate::outcome::{ConnectionHandle, DatagramOutcome, Event, Transmit};
+use crate::outcome::{ConnectionError, ConnectionHandle, DatagramOutcome, Event, Transmit};
 use crate::ratelimit::RateLimiter;
 use crate::replay::ReplayGuard;
 use crate::selector::{build_dcid, parse_dcid, selector_matches, DcidParts, DCID_LEN};
@@ -153,7 +153,9 @@ fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigErr
     for entry in &secrets.clients {
         let psk = *entry.psk.as_bytes();
         let crypto = Arc::new(PskServerConfig::new(quic_server.clone(), psk));
-        let server_config = Arc::new(TransportServerConfig::new(crypto, token_key.clone()));
+        let mut server_config = TransportServerConfig::new(crypto, token_key.clone());
+        server_config.transport_config(quietquic_transport_config());
+        let server_config = Arc::new(server_config);
         clients.push(ClientCrypto {
             client_id: entry.client_id.clone(),
             psk: entry.psk.clone(),
@@ -161,6 +163,12 @@ fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigErr
         });
     }
     Ok(clients)
+}
+
+fn quietquic_transport_config() -> Arc<TransportConfig> {
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+    Arc::new(transport)
 }
 
 /// An `EndpointConfig` whose CID generator records every CID it mints.
@@ -332,6 +340,7 @@ impl Endpoint {
             .map_err(|e| ConfigError::Io(std::io::Error::other(format!("client crypto: {e}"))))?;
         let psk_client = Arc::new(PskClientConfig::new(quic_client, psk));
         let mut client_config = TransportClientConfig::new(psk_client);
+        client_config.transport_config(quietquic_transport_config());
 
         // 3. Force the first-flight DCID to the selector.
         client_config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&dcid)));
@@ -737,7 +746,7 @@ impl Endpoint {
         //    locals because `self.connections` is borrowed for the whole loop.
         let mut events: Vec<Event> = Vec::new();
         let mut transmits: Vec<Transmit> = Vec::new();
-        let mut lost: Vec<ConnectionHandle> = Vec::new();
+        let mut lost: Vec<(ConnectionHandle, ConnectionError)> = Vec::new();
 
         for ch in &handles {
             let Some(state) = self.connections.get_mut(ch) else {
@@ -750,13 +759,27 @@ impl Endpoint {
                 events.push(Event::Connected(*ch));
             }
             for id in progress.opened {
-                events.push(Event::StreamOpened { conn: *ch, id });
+                events.push(Event::StreamOpened {
+                    conn: *ch,
+                    id,
+                    dir: quinn_proto::Dir::Bi,
+                });
             }
             for id in progress.readable {
                 events.push(Event::StreamReadable { conn: *ch, id });
             }
             for id in progress.writable {
                 events.push(Event::StreamWritable { conn: *ch, id });
+            }
+            for id in progress.fin_acked {
+                events.push(Event::StreamFinAcked { conn: *ch, id });
+            }
+            for (id, error_code) in progress.stopped {
+                events.push(Event::StreamStopped {
+                    conn: *ch,
+                    id,
+                    error_code,
+                });
             }
 
             // `progress.lost` alone is NOT enough, and this is the single most
@@ -777,8 +800,10 @@ impl Endpoint {
             // EITHER path. Guarded by `tests/connection_lifecycle.rs` and by
             // `a_locally_closed_connection_is_reaped_and_reports_connection_lost`
             // in `proto/tests/core_endpoint.rs`.
-            if progress.lost || state.is_drained() {
-                lost.push(*ch);
+            if let Some(reason) = progress.lost {
+                lost.push((*ch, reason));
+            } else if state.is_drained() {
+                lost.push((*ch, ConnectionError::LocallyClosed));
             }
 
             // Drain outbound datagrams. One datagram per `poll_transmit`
@@ -806,7 +831,7 @@ impl Endpoint {
 
         // 3. Reap. This happens AFTER the transmit drain above, so a closing
         //    connection's CONNECTION_CLOSE is already queued for the caller.
-        for ch in lost {
+        for (ch, reason) in lost {
             if self.connections.remove(&ch).is_some() {
                 self.by_quinn.remove(&ch.quinn);
                 self.client_ids.remove(&ch);
@@ -817,7 +842,8 @@ impl Endpoint {
                 // Emitted for BOTH loss paths, including a self-close that
                 // quinn-proto never reported: from the caller's point of view
                 // the handle is dead either way, and this is how it finds out.
-                self.events.push_back(Event::ConnectionLost { conn: ch });
+                self.events
+                    .push_back(Event::ConnectionLost { conn: ch, reason });
             }
         }
 

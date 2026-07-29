@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("server driver stopped")?;
     println!("accepted connection from {}", conn.remote_address());
 
-    let mut stream = conn.accept_stream().await?;
-    let got = stream.read_to_end(1024 * 1024).await?;
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let got = recv.read_to_end(1024 * 1024).await?;
     println!(
         "received {} bytes: {:?}",
         got.len(),
@@ -52,10 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Echo back on the same stream. Safe because this is strictly sequential —
     // read to end, THEN write. Concurrent read+write on one stream is not
     // supported; use two streams for full duplex.
-    stream.write_all(&got).await?;
-    stream.finish().await?;
+    send.write_all(&got).await?;
+    send.finish().await?;
     println!("echoed {} bytes back", got.len());
 
-    conn.close().await;
+    conn.close(0, b"").await?;
     Ok(())
 }

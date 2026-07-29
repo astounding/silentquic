@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: 0BSD
 //! Server pre-filter integration + `peek_dcid` unit tests.
 
+mod common;
+
 use quietquic::transport::peek_dcid;
 
 #[test]
@@ -36,13 +38,11 @@ use tokio::time::timeout;
 /// A `ServerSecrets` with one client, bound to an ephemeral port, built via TOML
 /// (the only public constructor for `ServerSecrets`).
 fn secrets_one_client() -> ServerSecrets {
-    let toml = r#"
-listen = "127.0.0.1:0"
-[[clients]]
-client_id = "test"
-psk = "1111111111111111111111111111111111111111111111111111111111111111"
-"#;
-    toml::from_str(toml).expect("valid server secrets")
+    toml::from_str(&format!(
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"test\"\npsk=\"1111111111111111111111111111111111111111111111111111111111111111\"\n",
+        common::bind_addr_string()
+    ))
+    .expect("valid server secrets")
 }
 
 /// The PSK matching `secrets_one_client` (0x11 * 32).
@@ -68,7 +68,9 @@ async fn assert_silent(payloads: &[Vec<u8>]) {
         .expect("bind server");
     let server_addr = server.local_addr();
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    let client = UdpSocket::bind(common::sender_bind_addr())
+        .await
+        .expect("bind client");
     for p in payloads {
         client.send_to(p, server_addr).await.expect("send junk");
     }
@@ -164,7 +166,8 @@ use quietquic::config::ClientConfigFile;
 async fn flood_of_junk_is_silent_and_server_stays_live() {
     let psk_hex = "0000000000000000000000000000000000000000000000000000000000000010";
     let secrets: ServerSecrets = toml::from_str(&format!(
-        "listen = \"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n"
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"a\"\npsk=\"{psk_hex}\"\n",
+        common::bind_addr_string()
     ))
     .unwrap();
 
@@ -175,7 +178,9 @@ async fn flood_of_junk_is_silent_and_server_stays_live() {
     // DCIDs, all from one attacker socket. None of these should ever reach
     // `Endpoint::handle`, whether they are dropped by the rate limiter or by
     // the selector/freshness checks further down the pre-filter.
-    let attacker = UdpSocket::bind("127.0.0.1:0").await.expect("bind attacker");
+    let attacker = UdpSocket::bind(common::sender_bind_addr())
+        .await
+        .expect("bind attacker");
     const FLOOD_SIZE: usize = 5_000;
 
     // Regression guard: this test is only meaningful if the flood volume

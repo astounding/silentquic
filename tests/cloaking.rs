@@ -25,6 +25,8 @@
 //!  6. `happy_path_connects_and_echoes` — correct-PSK `Client::connect`
 //!     succeeds, opens a stream, and echoes a payload end-to-end.
 
+mod common;
+
 use std::time::Duration;
 
 use aws_lc_rs::rand::SecureRandom;
@@ -50,13 +52,11 @@ const TEST_PSK: [u8; 32] = [0x11; 32];
 /// A `ServerSecrets` with one authorized client, bound to an ephemeral loopback
 /// port, built via TOML (the only public constructor for `ServerSecrets`).
 fn secrets_one_client() -> ServerSecrets {
-    let toml = r#"
-listen = "127.0.0.1:0"
-[[clients]]
-client_id = "authorized"
-psk = "1111111111111111111111111111111111111111111111111111111111111111"
-"#;
-    toml::from_str(toml).expect("valid server secrets")
+    toml::from_str(&format!(
+        "listen = \"{}\"\n[[clients]]\nclient_id=\"authorized\"\npsk=\"1111111111111111111111111111111111111111111111111111111111111111\"\n",
+        common::bind_addr_string()
+    ))
+    .expect("valid server secrets")
 }
 
 /// Build a synthetic QUIC long-header datagram carrying `dcid`, padded to look
@@ -95,7 +95,9 @@ async fn assert_silent(datagrams: &[Vec<u8>]) {
         .expect("bind server");
     let server_addr = server.local_addr();
 
-    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind sender");
+    let sender = UdpSocket::bind(common::sender_bind_addr())
+        .await
+        .expect("bind sender");
     for dg in datagrams {
         sender
             .send_to(dg, server_addr)
@@ -155,7 +157,7 @@ async fn junk_scan_is_silent() {
     for i in 0..100usize {
         let len = 1 + (i * 37) % 1400; // spread lengths across [1, 1400]
         let junk = random_bytes(len);
-        let sender = UdpSocket::bind("127.0.0.1:0")
+        let sender = UdpSocket::bind(common::sender_bind_addr())
             .await
             .expect("bind junk sender");
         sender
@@ -259,7 +261,7 @@ async fn replay_is_silent() {
     // crypto — see the core's `Endpoint::handle_datagram` ordering.) We don't assert silence
     // here; the point of this send is purely to populate the replay guard, as
     // the brief's fallback approach describes.
-    let first_sender = UdpSocket::bind("127.0.0.1:0")
+    let first_sender = UdpSocket::bind(common::sender_bind_addr())
         .await
         .expect("bind first sender");
     first_sender
@@ -273,7 +275,7 @@ async fn replay_is_silent() {
     // socket (different source address), proving the replay guard keys on
     // (nonce, freshness) and not on the sender. This must be silently
     // dropped: same nonce + same freshness has already been recorded.
-    let replay_sender = UdpSocket::bind("127.0.0.1:0")
+    let replay_sender = UdpSocket::bind(common::sender_bind_addr())
         .await
         .expect("bind replay sender");
     replay_sender
@@ -403,22 +405,18 @@ async fn happy_path_connects_and_echoes() {
             .accept()
             .await
             .expect("server should accept the authorized peer");
-        let mut stream = conn
-            .accept_stream()
+        let (mut send, mut recv) = conn
+            .accept_bi()
             .await
             .expect("server should accept a bidirectional stream");
-        let got = stream
+        let got = recv
             .read_to_end(1024)
             .await
             .expect("server should read the stream to end");
-        stream
-            .write_all(&got)
+        send.write_all(&got)
             .await
             .expect("server should write the echo");
-        stream
-            .finish()
-            .await
-            .expect("server should finish the echo");
+        send.finish().await.expect("server should finish the echo");
         got
     });
 
@@ -438,20 +436,13 @@ async fn happy_path_connects_and_echoes() {
     );
 
     const PAYLOAD: &[u8] = b"quietquic-cloaking-suite-happy-path";
-    let mut stream = conn
-        .open_stream()
-        .await
-        .expect("client should open a stream");
-    stream
-        .write_all(PAYLOAD)
+    let (mut send, mut recv) = conn.open_bi().await.expect("client should open a stream");
+    send.write_all(PAYLOAD)
         .await
         .expect("client should write the payload");
-    stream
-        .finish()
-        .await
-        .expect("client should finish its send");
+    send.finish().await.expect("client should finish its send");
 
-    let echo = timeout(HAPPY_TIMEOUT, stream.read_to_end(1024))
+    let echo = timeout(HAPPY_TIMEOUT, recv.read_to_end(1024))
         .await
         .expect("client read should not time out")
         .expect("client should read the echo");
